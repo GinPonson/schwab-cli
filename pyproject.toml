@@ -28,6 +28,7 @@ packages = ["src/schwab"]
 include = [
     "/src",
     "/tests",
+    "/docs",
     "/README.md",
     "/LICENSE",
     "/pyproject.toml",
