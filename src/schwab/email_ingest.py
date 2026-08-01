@@ -1,8 +1,8 @@
-"""解析 Gmail 取得的 Schwab eConfirm 正文并转换为标准交易 CSV。
+"""解析标准 Gmail API 或 RFC 5322 中的 Schwab eConfirm 并转换为交易 CSV。
 
-输入是 Gmail 读取工具或其他客户端导出的 JSON。每封邮件必须保留 ``id``、
-``from_``、``subject`` 与完整 ``body``；仅含 snippet 的搜索结果不能用于记账。
-解析器只接受已知的 Schwab eConfirm 字段组合，任何缺失或未知格式都会整体报错。
+核心输入协议仅包括 Gmail ``users.messages.get(format=full/raw)`` 标准响应和
+RFC 5322/MIME 邮件。特定连接器的紧凑 JSON 必须先在 CLI 外转换为标准邮件。
+解析器只接受已知 Schwab eConfirm 字段组合，任何缺失或歧义都会整体报错。
 """
 
 from __future__ import annotations
@@ -24,8 +24,10 @@ from .ingest import IngestError, OPTION_MULTIPLIER, parse_option_symbol
 
 
 SCHWAB_SENDER_RE = re.compile(r"(?:^|[<\s])[^<>\s]+@(?:[a-z0-9-]+\.)*schwab\.com(?:>|\s|$)", re.I)
-ACCOUNT_SUFFIX_RE = re.compile(r"Account ending:\s*([A-Za-z0-9]+)", re.I)
-SYMBOL_SPLIT_RE = re.compile(r"\n\s*Symbol:\s*\n", re.I)
+ACCOUNT_SUFFIX_RE = re.compile(
+    r"Account\s+ending(?:\s+in\s+|\s*:\s*)([A-Za-z0-9]+)", re.I
+)
+SYMBOL_SPLIT_RE = re.compile(r"(?:^|\n)\s*Symbol:\s*\n", re.I)
 MONEY_RE = re.compile(r"^-?\$[\d,]+(?:\.\d+)?$")
 
 # eConfirm 的 Action 表示成交方向，Type 表示成交后的持仓类型。
@@ -41,13 +43,22 @@ STOCK_ACTIONS = {"Purchase": "Buy", "Sale": "Sell"}
 
 @dataclass(frozen=True)
 class GmailMessage:
-    """一封带完整正文的 Gmail 邮件。"""
+    """一封带标准邮件头和一个或多个正文候选的邮件。"""
 
     message_id: str
     sender: str
     subject: str
     body: str
     email_ts: str | None
+    body_candidates: tuple[str, ...] = ()
+
+    def candidate_bodies(self) -> tuple[str, ...]:
+        """按稳定顺序返回去重后的正文候选，主正文始终排在第一位。"""
+        unique: list[str] = []
+        for candidate in (self.body, *self.body_candidates):
+            if candidate.strip() and candidate not in unique:
+                unique.append(candidate)
+        return tuple(unique)
 
 
 @dataclass(frozen=True)
@@ -216,6 +227,49 @@ def _collect_text_parts(part: dict, *, where: str) -> list[tuple[str, str]]:
     return results
 
 
+def _normalize_text_candidates(parts: list[tuple[str, str]]) -> tuple[str, ...]:
+    """把 MIME 文本部分转换为稳定、去重的可解析正文候选。
+
+    ``text/plain`` 保持原文，``text/html`` 仅做通用可见文本提取。候选之间不
+    拼接，避免两个 alternative 表示产生重复交易块。
+    """
+    candidates: list[str] = []
+    # 先尝试 plain，再尝试 HTML；最终仍要求所有成功候选生成完全一致的交易。
+    for expected_type in ("text/plain", "text/html"):
+        for mime_type, content in parts:
+            if mime_type != expected_type:
+                continue
+            candidate = _html_to_text(content) if mime_type == "text/html" else content
+            if candidate.strip() and candidate not in candidates:
+                candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _mime_text_candidates(parsed, *, where: str) -> tuple[str, ...]:
+    """从 RFC 5322 邮件中提取所有内联 plain/HTML 正文候选。"""
+    parts: list[tuple[str, str]] = []
+    try:
+        for part in parsed.walk():
+            mime_type = part.get_content_type().lower()
+            if mime_type not in {"text/plain", "text/html"}:
+                continue
+            disposition = part.get_content_disposition()
+            if disposition == "attachment":
+                continue
+            content = part.get_content()
+            if not isinstance(content, str):
+                raise IngestError(f"{where}: MIME 文本正文解码结果不是字符串")
+            parts.append((mime_type, content))
+    except IngestError:
+        raise
+    except Exception as exc:
+        raise IngestError(f"{where}: 无法解码 MIME 文本正文: {exc}") from exc
+    candidates = _normalize_text_candidates(parts)
+    if not candidates:
+        raise IngestError(f"{where}: MIME 中没有内联 text/plain 或 text/html 正文")
+    return candidates
+
+
 def _from_gmail_api(record: dict, *, where: str) -> GmailMessage:
     """解析标准 Gmail API ``users.messages.get`` 的 full 或 raw 响应。"""
     message_id = str(record.get("id") or "").strip()
@@ -231,11 +285,9 @@ def _from_gmail_api(record: dict, *, where: str) -> GmailMessage:
                 f"{where}: Gmail format=full 响应不含内联 text/plain 或 text/html 正文；"
                 "附件式正文需要先通过 Gmail API 取得 attachment data"
             )
-        decoded = next(
-            (part for part in decoded_parts if part[0] == "text/plain"), decoded_parts[0]
-        )
-        mime_type, content = decoded
-        body = _html_to_text(content) if mime_type == "text/html" else content
+        candidates = _normalize_text_candidates(decoded_parts)
+        if not candidates:
+            raise IngestError(f"{where}: Gmail format=full 没有可解析的文本正文")
         sender = headers.get("from", "")
         subject = headers.get("subject", "")
         email_ts = headers.get("date") or str(record.get("internalDate") or "") or None
@@ -243,15 +295,11 @@ def _from_gmail_api(record: dict, *, where: str) -> GmailMessage:
         raw_message = _decode_base64url(record["raw"], where=where)
         try:
             parsed = BytesParser(policy=policy.default).parsebytes(raw_message)
-            preferred = parsed.get_body(preferencelist=("plain", "html"))
-            if preferred is None:
-                raise IngestError(f"{where}: Gmail format=raw MIME 中没有文本正文")
-            content = preferred.get_content()
+            candidates = _mime_text_candidates(parsed, where=where)
         except IngestError:
             raise
         except Exception as exc:
             raise IngestError(f"{where}: 无法解析 Gmail format=raw MIME: {exc}") from exc
-        body = _html_to_text(content) if preferred.get_content_type() == "text/html" else content
         sender = str(parsed.get("From") or "")
         subject = str(parsed.get("Subject") or "")
         email_ts = str(parsed.get("Date") or "") or None
@@ -261,8 +309,8 @@ def _from_gmail_api(record: dict, *, where: str) -> GmailMessage:
         )
 
     return GmailMessage(
-        message_id=message_id, sender=sender, subject=subject, body=body,
-        email_ts=email_ts,
+        message_id=message_id, sender=sender, subject=subject, body=candidates[0],
+        email_ts=email_ts, body_candidates=candidates[1:],
     )
 
 
@@ -270,15 +318,11 @@ def _from_raw_mime(raw_message: bytes, *, where: str) -> GmailMessage:
     """把未经转换的 RFC 5322/MIME 邮件解析为内部邮件对象。"""
     try:
         parsed = BytesParser(policy=policy.default).parsebytes(raw_message)
-        preferred = parsed.get_body(preferencelist=("plain", "html"))
-        if preferred is None:
-            raise IngestError(f"{where}: 原始 MIME 中没有文本正文")
-        content = preferred.get_content()
+        candidates = _mime_text_candidates(parsed, where=where)
     except IngestError:
         raise
     except Exception as exc:
         raise IngestError(f"{where}: 无法解析原始 MIME: {exc}") from exc
-    body = _html_to_text(content) if preferred.get_content_type() == "text/html" else content
     # .eml 不保证保留 Gmail 内部 ID；优先使用 Gmail 扩展头和 Message-ID，最后
     # 使用完整 MIME 哈希，确保同一原始邮件重复导入时标识稳定。
     message_id = str(
@@ -289,8 +333,9 @@ def _from_raw_mime(raw_message: bytes, *, where: str) -> GmailMessage:
         message_id=message_id,
         sender=str(parsed.get("From") or ""),
         subject=str(parsed.get("Subject") or ""),
-        body=body,
+        body=candidates[0],
         email_ts=str(parsed.get("Date") or "") or None,
+        body_candidates=candidates[1:],
     )
 
 
@@ -309,9 +354,8 @@ def _normalize_description(symbol: str, security_description: str) -> str:
 def load_gmail_content(data: bytes, *, source_name: str) -> list[GmailMessage]:
     """自动识别 Gmail API JSON 或原始 RFC 5322/MIME 邮件。
 
-    首选输入是 ``users.messages.get`` 的 ``format=full`` 或 ``format=raw`` 标准
-    响应，也可直接输入 Gmail 下载的原始 ``.eml``。为兼容 Codex Gmail 连接器，
-    继续接受包含完整 ``body`` 的单封对象及 ``responses`` 包装。
+    JSON 仅接受 ``users.messages.get`` 的 ``format=full`` / ``format=raw`` 标准
+    响应或这些响应组成的数组；非 JSON 输入按原始 RFC 5322/MIME 解析。
     """
     try:
         payload = json.loads(data.decode("utf-8-sig"))
@@ -325,23 +369,12 @@ def load_gmail_content(data: bytes, *, source_name: str) -> list[GmailMessage]:
             raise IngestError(f"{source_name}: 不是 Schwab eConfirms 邮件: {message.subject!r}")
         return [message]
 
-    while isinstance(payload, dict):
-        if "structuredContent" in payload:
-            payload = payload["structuredContent"]
-        elif "result" in payload and isinstance(payload["result"], (dict, list)):
-            payload = payload["result"]
-        else:
-            break
-    if isinstance(payload, dict) and "responses" in payload:
-        records = payload["responses"]
-    elif isinstance(payload, dict) and "messages" in payload:
+    if isinstance(payload, dict) and "messages" in payload:
         raise IngestError(
             f"{source_name}: Gmail users.messages.list 只返回 message id；"
             "请对每个 id 调用 users.messages.get(format=full 或 raw) 后再导入"
         )
-    elif isinstance(payload, dict) and "emails" in payload:
-        records = payload["emails"]
-    elif isinstance(payload, list):
+    if isinstance(payload, list):
         records = payload
     elif isinstance(payload, dict):
         records = [payload]
@@ -355,22 +388,12 @@ def load_gmail_content(data: bytes, *, source_name: str) -> list[GmailMessage]:
         where = f"{source_name} 第{index}封"
         if not isinstance(record, dict):
             raise IngestError(f"{where}: 邮件必须是 JSON 对象")
-        if "payload" in record or "raw" in record:
-            message = _from_gmail_api(record, where=where)
-        else:
-            # 兼容已经提供标准化 body 的 Gmail 连接器读取结果。
-            message_id = str(record.get("id") or "").strip()
-            sender = str(record.get("from_") or record.get("from") or "").strip()
-            subject = str(record.get("subject") or "").strip()
-            body = record.get("body")
-            if not message_id:
-                raise IngestError(f"{where}: 缺少 Gmail message id")
-            if not isinstance(body, str) or not body.strip():
-                raise IngestError(f"{where}: 缺少完整 body；Gmail 搜索摘要不能用于导入")
-            message = GmailMessage(
-                message_id=message_id, sender=sender, subject=subject, body=body,
-                email_ts=str(record["email_ts"]) if record.get("email_ts") is not None else None,
+        if "payload" not in record and "raw" not in record:
+            raise IngestError(
+                f"{where}: 不是 Gmail users.messages.get(format=full/raw) 标准响应；"
+                "特定连接器 JSON 请先在 CLI 外转换为 RFC 5322 .eml"
             )
+        message = _from_gmail_api(record, where=where)
         if not SCHWAB_SENDER_RE.search(message.sender):
             raise IngestError(f"{where}: 发件人不是可识别的 Schwab 域名: {message.sender!r}")
         if "Schwab eConfirms" not in message.subject:
@@ -389,23 +412,52 @@ def load_gmail_messages(path: Path) -> list[GmailMessage]:
 
 
 def account_suffix(message: GmailMessage) -> str:
-    """从 eConfirm 正文提取账户尾号。"""
-    match = ACCOUNT_SUFFIX_RE.search(message.body)
-    if not match:
+    """从标准 Subject 与所有正文候选提取一致的账户尾号。"""
+    suffixes = {
+        match.group(1)
+        for source in (message.subject, *message.candidate_bodies())
+        for match in ACCOUNT_SUFFIX_RE.finditer(source)
+    }
+    if not suffixes:
         raise IngestError(f"邮件 {message.message_id}: 缺少 Account ending")
-    return match.group(1)
+    if len(suffixes) != 1:
+        raise IngestError(
+            f"邮件 {message.message_id}: Subject 与正文中的账户尾号不一致: "
+            f"{sorted(suffixes)}"
+        )
+    return suffixes.pop()
 
 
 def parse_econfirm(message: GmailMessage) -> list[EmailTrade]:
-    """把一封 Schwab eConfirm 严格解析为逐笔成交。"""
-    parts = SYMBOL_SPLIT_RE.split(message.body)
+    """严格解析所有正文候选，并拒绝候选之间不一致的交易结果。"""
+    successes: list[list[EmailTrade]] = []
+    errors: list[str] = []
+    for index, body in enumerate(message.candidate_bodies(), start=1):
+        try:
+            trades = _parse_econfirm_body(message.message_id, body)
+        except IngestError as exc:
+            errors.append(f"候选{index}: {exc}")
+            continue
+        if trades not in successes:
+            successes.append(trades)
+    if not successes:
+        details = "；".join(errors)
+        raise IngestError(f"邮件 {message.message_id}: 所有正文候选解析失败: {details}")
+    if len(successes) != 1:
+        raise IngestError(f"邮件 {message.message_id}: plain 与 HTML 解析出的交易不一致")
+    return successes[0]
+
+
+def _parse_econfirm_body(message_id: str, body: str) -> list[EmailTrade]:
+    """把单个规范化正文候选严格解析为逐笔成交。"""
+    parts = SYMBOL_SPLIT_RE.split(body)
     if len(parts) < 2:
-        raise IngestError(f"邮件 {message.message_id}: 正文中没有交易块")
+        raise IngestError(f"正文中没有交易块")
 
     trades: list[EmailTrade] = []
     for block_index, raw_block in enumerate(parts[1:], start=1):
         block = raw_block.split("Additional information for this security:", 1)[0]
-        where = f"邮件 {message.message_id} 第{block_index}笔"
+        where = f"邮件 {message_id} 第{block_index}笔"
         first_line = next((line.strip() for line in block.splitlines() if line.strip()), "")
         symbol = _unwrap_symbol(first_line)
         description = _field(block, "Security Description", where=where)
@@ -444,6 +496,14 @@ def _parse_value_rows(
     单笔期权可包含 commission 与 industry fee；多价格成交仅在各行金额可直接
     勾稽且汇总费用为零时展开，避免自行猜测费用分配。
     """
+    # 金额表后的披露文本不属于成交字段；仅接受已知边界，避免吞掉未知格式。
+    disclosure_index = next((
+        index for index, value in enumerate(values)
+        if value.lower().startswith("for the above:")
+    ), None)
+    if disclosure_index is not None:
+        values = values[:disclosure_index]
+
     if "Totals" in values:
         totals_index = values.index("Totals")
         fill_values = values[:totals_index]
@@ -466,22 +526,80 @@ def _parse_value_rows(
             raise IngestError(f"{where}: 多价格成交金额与 Totals 不一致")
         return rows
 
-    money_values = [value for value in values if MONEY_RE.match(value)]
-    if len(values) == 4 and len(money_values) == 3:
-        quantity, price, principal, amount = values
-        fees = Decimal(0)
-    elif len(values) == 9 and values[4].lower() == "industry fee:" and values[6].lower() == "total:":
-        quantity, price, principal = values[:3]
-        fees = _decimal(values[3], where=where) + _decimal(values[5], where=where)
-        amount = values[8]
-        if fees != _decimal(values[7], where=where):
-            raise IngestError(f"{where}: 分项费用与 Total 不一致")
-    else:
+    if len(values) < 4:
         raise IngestError(f"{where}: 无法识别成交金额结构: {values!r}")
+    quantity, price, principal = values[:3]
+    tail = values[3:]
+
+    if len(tail) == 1 and MONEY_RE.match(tail[0]):
+        fees = Decimal(0)
+        amount = tail[0]
+    elif len(tail) == 2 and tail[0].rstrip(":").lower() == "n/a" \
+            and MONEY_RE.match(tail[1]):
+        # HTML 表格常把无费用单元格渲染为单个 N/A。
+        fees = Decimal(0)
+        amount = tail[1]
+    elif len(tail) == 4 and tail[0].lower() == "n/a:" \
+            and tail[2].lower() == "n/a" and MONEY_RE.match(tail[1]) \
+            and MONEY_RE.match(tail[3]):
+        # plain 模板会同时保留 N/A 标签、零费用值和 N/A 说明。
+        fees = _decimal(tail[1], where=where)
+        if fees != 0:
+            raise IngestError(f"{where}: N/A 费用必须为 0，实际 {fees}")
+        amount = tail[3]
+    else:
+        fees, amount = _parse_labeled_fees(tail, where=where)
     return [_build_trade(
         trade_date, action, symbol, description, quantity, price, principal,
         fees, amount, multiplier, where,
     )]
+
+
+def _parse_labeled_fees(values: list[str], *, where: str) -> tuple[Decimal, str]:
+    """严格解析 Commission、Industry Fee 与 Total 标签组成的费用区域。"""
+    index = 0
+    if index < len(values) and values[index].lower() == "commission:":
+        index += 1
+        if index >= len(values) or not MONEY_RE.match(values[index]):
+            raise IngestError(f"{where}: Commission 后缺少金额")
+        commission = _decimal(values[index], where=where)
+        index += 1
+        # Schwab 新模板可能在佣金金额后附加一个独立的 Commission 说明单元格。
+        if index < len(values) and values[index].lower() == "commission":
+            index += 1
+    elif index < len(values) and MONEY_RE.match(values[index]):
+        # 旧模板仅保留佣金金额，没有 Commission 标签。
+        commission = _decimal(values[index], where=where)
+        index += 1
+    else:
+        raise IngestError(f"{where}: 无法识别 Commission 字段: {values!r}")
+
+    if index >= len(values) or values[index].lower() != "industry fee:":
+        raise IngestError(f"{where}: 缺少 Industry Fee 标签")
+    index += 1
+    if index >= len(values) or not MONEY_RE.match(values[index]):
+        raise IngestError(f"{where}: Industry Fee 后缺少金额")
+    industry_fee = _decimal(values[index], where=where)
+    index += 1
+
+    if index >= len(values) or values[index].lower() != "total:":
+        raise IngestError(f"{where}: 缺少费用 Total 标签")
+    index += 1
+    if index >= len(values) or not MONEY_RE.match(values[index]):
+        raise IngestError(f"{where}: Total 后缺少费用金额")
+    total_fees = _decimal(values[index], where=where)
+    index += 1
+    if index >= len(values) or not MONEY_RE.match(values[index]):
+        raise IngestError(f"{where}: 费用表后缺少成交净额")
+    amount = values[index]
+    index += 1
+    if index != len(values):
+        raise IngestError(f"{where}: 费用表包含未知字段: {values[index:]!r}")
+
+    fees = commission + industry_fee
+    if fees != total_fees:
+        raise IngestError(f"{where}: 分项费用与 Total 不一致")
+    return fees, amount
 
 
 def _build_trade(

@@ -114,7 +114,7 @@ explicitly; the CLI does not silently skip them.
 
 ### Import Gmail eConfirm messages
 
-`import-email` accepts raw Gmail content without a project-specific conversion:
+`import-email` accepts standard Gmail API responses and RFC 5322 mail directly:
 
 - Gmail API `users.messages.get(format=full)` JSON;
 - Gmail API `users.messages.get(format=raw)` JSON;
@@ -147,6 +147,24 @@ schwab reconcile gmail-econfirms.json
 
 `matched` means an exact match, `missing` means no corresponding ledger trade,
 and `conflict` means a same-date, same-contract record differs in key fields.
+
+### Non-standard connector JSON
+
+The core CLI intentionally rejects connector-specific objects such as
+`{id, from, subject, body}`. If google-workspace returns this compact shape,
+convert it to standard RFC 5322 messages with the standalone adapter:
+
+```bash
+python scripts/google_workspace_to_eml.py \
+  google-workspace-get.json \
+  --output-dir normalized-emails
+
+schwab reconcile normalized-emails/*.eml
+schwab import-email normalized-emails/*.eml
+```
+
+The adapter performs no network access, credential loading, Schwab parsing, or
+database operations. It rejects search results that contain only a snippet.
 
 ## Core commands
 
@@ -258,6 +276,7 @@ Project layout:
 ```text
 src/schwab/        CLI, ingestion, email parsing, database, and FIFO engine
 tests/             Regression tests built from synthetic data
+scripts/           Standalone adapters for non-standard external formats
 docs/              Advanced usage and analysis documentation
 ```
 

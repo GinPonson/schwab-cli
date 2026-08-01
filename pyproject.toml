@@ -28,6 +28,7 @@ packages = ["src/schwab"]
 include = [
     "/src",
     "/tests",
+    "/scripts",
     "/docs",
     "/README.md",
     "/README.zh-CN.md",

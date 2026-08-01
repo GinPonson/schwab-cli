@@ -88,7 +88,7 @@ schwab rebuild
 
 ## Gmail eConfirm 导入
 
-`import-email` 可以直接接收：
+`import-email` 只直接接收标准 Gmail API 响应和 RFC 5322 邮件：
 
 - Gmail API `users.messages.get(format=full)` JSON；
 - Gmail API `users.messages.get(format=raw)` JSON；
@@ -114,6 +114,23 @@ schwab import-email gmail-econfirms.json --account ACCOUNT000
 ```bash
 schwab reconcile gmail-econfirms.json
 ```
+
+### 非标准连接器 JSON
+
+核心 CLI 不接受 `{id, from, subject, body}` 等特定连接器紧凑对象。如果
+google-workspace 返回此类结构，先用项目外层的独立适配脚本转换为标准 RFC 5322：
+
+```bash
+python scripts/google_workspace_to_eml.py \
+  google-workspace-get.json \
+  --output-dir normalized-emails
+
+schwab reconcile normalized-emails/*.eml
+schwab import-email normalized-emails/*.eml
+```
+
+该脚本不访问网络、不读取凭据、不解析 Schwab 交易，也不操作数据库。只有 snippet
+而没有完整 body 的搜索结果会被明确拒绝。
 
 ## 基础命令
 

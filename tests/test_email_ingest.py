@@ -12,7 +12,12 @@ from typer.testing import CliRunner
 
 from schwab import db as dbmod
 from schwab.cli import app
-from schwab.email_ingest import GmailMessage, load_gmail_messages, parse_econfirm
+from schwab.email_ingest import (
+    GmailMessage,
+    account_suffix,
+    load_gmail_messages,
+    parse_econfirm,
+)
 from schwab.ingest import IngestError
 
 
@@ -62,6 +67,16 @@ def _message(body: str, message_id: str = "gmail-message-1") -> GmailMessage:
     )
 
 
+def _raw_gmail_record(body: str, message_id: str = "gmail-raw-1") -> dict:
+    """把合成正文封装为标准 Gmail API ``format=raw`` 响应。"""
+    mime = EmailMessage()
+    mime["From"] = "Schwab Alerts <donotreply@mail.schwab.com>"
+    mime["Subject"] = "Schwab eConfirms account ending in 276"
+    mime["Date"] = "Fri, 24 Jul 2026 16:25:59 +0000"
+    mime.set_content(body)
+    return {"id": message_id, "threadId": "thread-1", "raw": _base64url(mime.as_bytes())}
+
+
 @pytest.mark.parametrize(("reported_action", "position_type", "expected"), [
     ("Purchase", "Margin", "Buy to Open"),
     ("Sale", "Margin", "Sell to Close"),
@@ -102,16 +117,30 @@ def test_unknown_option_type_is_rejected():
 
 
 def test_load_rejects_search_result_without_body(tmp_path):
-    """只有 snippet 的 Gmail 搜索结果不能作为账务输入。"""
+    """非标准连接器搜索结果不能作为核心 CLI 输入。"""
     path = tmp_path / "gmail.json"
-    path.write_text(json.dumps({"emails": [{
+    path.write_text(json.dumps({
         "id": "message-1",
-        "from_": "Schwab Alerts donotreply@mail.schwab.com",
+        "from": "Schwab Alerts donotreply@mail.schwab.com",
         "subject": "Schwab eConfirms account ending in 276",
         "snippet": "Electronic Trade Confirmation(s)",
-    }]}), encoding="utf-8")
+    }), encoding="utf-8")
 
-    with pytest.raises(IngestError, match="缺少完整 body"):
+    with pytest.raises(IngestError, match="不是 Gmail users.messages.get"):
+        load_gmail_messages(path)
+
+
+def test_load_rejects_connector_compact_body_object(tmp_path):
+    """核心协议必须拒绝特定连接器的 ``id/from/subject/body`` 紧凑对象。"""
+    path = tmp_path / "compact.json"
+    path.write_text(json.dumps({
+        "id": "message-1",
+        "from": "Schwab Alerts <donotreply@mail.schwab.com>",
+        "subject": "Schwab eConfirms account ending in 276",
+        "body": "complete but non-standard body",
+    }), encoding="utf-8")
+
+    with pytest.raises(IngestError, match="CLI 外转换为 RFC 5322"):
         load_gmail_messages(path)
 
 
@@ -159,17 +188,8 @@ def test_load_standard_gmail_api_raw_response(tmp_path):
         position_type="Margin", quantity="10", price="88.8323",
         principal="888.32", fees="0", amount="888.32",
     )
-    mime = EmailMessage()
-    mime["From"] = "Schwab Alerts <donotreply@mail.schwab.com>"
-    mime["Subject"] = "Schwab eConfirms account ending in 276"
-    mime["Date"] = "Fri, 24 Jul 2026 16:25:59 +0000"
-    mime.set_content(body)
     path = tmp_path / "gmail-raw.json"
-    path.write_text(json.dumps({
-        "id": "gmail-raw-1",
-        "threadId": "thread-1",
-        "raw": _base64url(mime.as_bytes()),
-    }), encoding="utf-8")
+    path.write_text(json.dumps(_raw_gmail_record(body)), encoding="utf-8")
 
     messages = load_gmail_messages(path)
     trades = parse_econfirm(messages[0])
@@ -227,6 +247,71 @@ def test_load_standard_gmail_api_full_html_fallback(tmp_path):
     assert "Symbol:\n\nINTC" in message.body
 
 
+def test_multipart_uses_subject_account_and_parseable_plain_candidate(tmp_path):
+    """plain 缺账户而 HTML 含账户时，应从标准头/候选取账户并解析有效正文。"""
+    plain = _trade_block(
+        symbol="INTC", description="INTEL CORP", action="Purchase",
+        position_type="Margin", quantity="10", price="88.8323",
+        principal="888.32", fees="0", amount="888.32",
+    )
+    html = "<html><body><a href='https://example.invalid'>Account ending: 276</a></body></html>"
+    mime = EmailMessage()
+    mime["From"] = "Schwab Alerts <donotreply@mail.schwab.com>"
+    mime["Subject"] = "Schwab eConfirms account ending in 276"
+    mime.set_content(plain)
+    mime.add_alternative(html, subtype="html")
+    path = tmp_path / "multipart-raw.json"
+    path.write_text(json.dumps({
+        "id": "multipart-1", "raw": _base64url(mime.as_bytes()),
+    }), encoding="utf-8")
+
+    message = load_gmail_messages(path)[0]
+    trades = parse_econfirm(message)
+
+    assert message.candidate_bodies()[0].find("Symbol:") >= 0
+    assert len(message.candidate_bodies()) == 2
+    assert trades[0].price == Decimal("88.8323")
+
+
+def test_account_suffix_conflict_is_rejected():
+    """Subject 与正文账户尾号冲突时必须失败，禁止选择任一来源。"""
+    message = GmailMessage(
+        message_id="conflict-1",
+        sender="Schwab Alerts <donotreply@mail.schwab.com>",
+        subject="Schwab eConfirms account ending in 111",
+        body="Account ending: 222",
+        email_ts=None,
+    )
+
+    with pytest.raises(IngestError, match="账户尾号不一致"):
+        account_suffix(message)
+
+
+def test_mime_candidates_with_different_trades_are_rejected():
+    """多个正文候选若产生不同成交，必须拒绝而不是任意选择一个。"""
+    first = _trade_block(
+        symbol="INTC", description="INTEL CORP", action="Purchase",
+        position_type="Margin", quantity="1", price="10.00",
+        principal="10.00", fees="0", amount="10.00",
+    )
+    second = _trade_block(
+        symbol="INTC", description="INTEL CORP", action="Purchase",
+        position_type="Margin", quantity="1", price="11.00",
+        principal="11.00", fees="0", amount="11.00",
+    )
+    message = GmailMessage(
+        message_id="candidate-conflict-1",
+        sender="Schwab Alerts <donotreply@mail.schwab.com>",
+        subject="Schwab eConfirms account ending in 276",
+        body=first,
+        email_ts=None,
+        body_candidates=(second,),
+    )
+
+    with pytest.raises(IngestError, match="交易不一致"):
+        parse_econfirm(message)
+
+
 def test_gmail_messages_list_is_rejected_with_actionable_error(tmp_path):
     """messages.list 没有正文，错误必须说明需要继续调用 messages.get。"""
     path = tmp_path / "gmail-list.json"
@@ -252,6 +337,47 @@ def test_stock_price_precision_is_preserved():
     assert trade.action == "Buy"
     assert trade.price == Decimal("88.8323")
     assert trade.csv_row()[5] == "$88.8323"
+
+
+def test_new_labeled_option_fee_structure_is_parsed():
+    """新版 Schwab Commission 标签与说明行应按字段语义解析。"""
+    body = _trade_block(
+        symbol="INTC 07/31/2026 120.00 C",
+        description="INTEL CORP 07/31/2026 $120 Call",
+        action="Purchase", position_type="Margin",
+        quantity="1", price="19.30", principal="1930.00",
+        fees="0", amount="1930.66",
+    ).replace(
+        "\n\n$1930.66\n\nAdditional information",
+        "\n\nCommission:\n\n$0.65\n\nCommission"
+        "\n\nIndustry Fee:\n\n$0.01\n\nTotal:\n\n$0.66"
+        "\n\n$1930.66\n\nAdditional information",
+    )
+
+    trade = parse_econfirm(_message(body))[0]
+
+    assert trade.fees == Decimal("0.66")
+    assert trade.amount == Decimal("-1930.66")
+
+
+def test_new_stock_na_fee_structure_and_disclosure_are_parsed():
+    """新版股票 N/A 费用单元格与表后披露文本应严格分界。"""
+    body = _trade_block(
+        symbol="INTC", description="INTEL CORP", action="Purchase",
+        position_type="Margin", quantity="20", price="104.129",
+        principal="2082.58", fees="0", amount="2082.58",
+    ).replace(
+        "\n\n$2082.58\n\nAdditional information",
+        "\n\nN/A:\n\n$0.00\n\nN/A\n\n$2082.58"
+        "\n\nFor the above:\n\nDisclosure text"
+        "\n\nAdditional information",
+    )
+
+    trade = parse_econfirm(_message(body))[0]
+
+    assert trade.quantity == Decimal("20")
+    assert trade.fees == 0
+    assert trade.amount == Decimal("-2082.58")
 
 
 def test_multiple_zero_fee_stock_fills_are_expanded():
@@ -286,13 +412,9 @@ def test_import_email_cli_imports_and_is_idempotent(tmp_path):
         quantity="1", price="2.29", principal="229.00", fees="0.66", amount="228.34",
     )
     path = tmp_path / "gmail.json"
-    path.write_text(json.dumps({"responses": [{
-        "id": "message-1",
-        "from_": "Schwab Alerts donotreply@mail.schwab.com",
-        "subject": "Schwab eConfirms account ending in 276",
-        "body": "Account ending: 276" + body,
-        "email_ts": "2026-07-24T16:25:59",
-    }]}), encoding="utf-8")
+    path.write_text(json.dumps(
+        _raw_gmail_record("Account ending: 276" + body, "message-1")
+    ), encoding="utf-8")
     db_path = tmp_path / "email.duckdb"
 
     first = runner.invoke(app, [
@@ -328,12 +450,9 @@ def test_reconcile_reports_matched_and_missing_without_writing(tmp_path):
         quantity="1", price="2.29", principal="229.00", fees="0.66", amount="228.34",
     )
     path = tmp_path / "gmail.json"
-    path.write_text(json.dumps({
-        "id": "message-1",
-        "from_": "Schwab Alerts donotreply@mail.schwab.com",
-        "subject": "Schwab eConfirms account ending in 276",
-        "body": "Account ending: 276" + body,
-    }), encoding="utf-8")
+    path.write_text(json.dumps(
+        _raw_gmail_record("Account ending: 276" + body, "message-1")
+    ), encoding="utf-8")
     populated_db = tmp_path / "populated.duckdb"
     imported = runner.invoke(app, [
         "import-email", str(path), "--account", "TST276", "--no-rebuild",
