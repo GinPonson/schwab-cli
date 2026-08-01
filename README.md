@@ -1,59 +1,63 @@
 # schwab
 
-本地优先的 Charles Schwab 交易记录 CLI。它将 Transactions CSV 或 Gmail
-eConfirm 原始邮件导入 DuckDB，按 FIFO 重建股票和期权持仓，并提供稳定的 JSON
-输出供脚本与 AI 使用。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-> 本项目是个人账本工具，与 Charles Schwab & Co., Inc. 无关。输出仅用于记录与
-> 分析，不构成投资、税务或会计建议。
+A local-first command-line ledger for Charles Schwab transactions. It imports
+Transactions CSV exports or raw Gmail eConfirm messages into DuckDB, rebuilds
+stock and option positions with FIFO accounting, and exposes stable JSON output
+for scripts and AI workflows.
 
-## 特性
+> This is an independent personal ledger project and is not affiliated with
+> Charles Schwab & Co., Inc. Its output is for recordkeeping and analysis only;
+> it is not investment, tax, or accounting advice.
 
-- 幂等导入 Schwab Transactions CSV，重叠快照不会重复记账。
-- 直接读取 Gmail API `full` / `raw` JSON、JSON 数组或原始 `.eml`。
-- 股票与期权 FIFO 重放，严格处理开仓、平仓、到期和指派。
-- 本地 DuckDB 存储，不上传交易记录。
-- 所有命令支持 `--json`，业务错误使用稳定的非零退出码。
-- 内置账本审计、Gmail 对账、持仓、现金流和已实现损益查询。
-- 提供月度绩效、归因、回撤、集中度和期权压力等高级分析。
+## Features
 
-## 环境要求
+- Idempotent Schwab Transactions CSV imports across overlapping exports.
+- Direct ingestion of Gmail API `full` / `raw` JSON, JSON arrays, and `.eml`.
+- FIFO replay for stocks and options, including closes, expiration, and assignment.
+- Local DuckDB storage; transaction data is not uploaded by the application.
+- Stable `--json` output and non-zero exit codes for known business errors.
+- Ledger auditing, Gmail reconciliation, positions, cash flow, and realized P&L.
+- Monthly performance, attribution, drawdown, concentration, and option stress analysis.
+
+## Requirements
 
 - Python 3.11+
-- [uv](https://docs.astral.sh/uv/)（推荐）或
+- [uv](https://docs.astral.sh/uv/) (recommended) or
   [pipx](https://pipx.pypa.io/)
 
-## 安装
+## Installation
 
-从项目目录安装为当前用户可直接调用的命令：
+Install the command into an isolated user environment from the project directory:
 
 ```bash
 uv tool install .
 schwab --help
 ```
 
-如果终端找不到命令，执行一次 `uv tool update-shell` 后重新打开终端。更新本地
-代码后重新安装：
+If the command is not on `PATH`, run `uv tool update-shell` once and restart the
+terminal. Reinstall after updating the local source:
 
 ```bash
 uv tool install --force .
 ```
 
-也可以使用 pipx：
+Alternatively, use pipx:
 
 ```bash
 pipx install .
 ```
 
-卸载：
+Uninstall:
 
 ```bash
 uv tool uninstall schwab
 ```
 
-## 快速开始
+## Quick start
 
-导入 Schwab CSV，重建 FIFO，再检查账户和持仓：
+Import an official Schwab CSV export, rebuild FIFO products, and inspect the ledger:
 
 ```bash
 schwab import Individual_ACCOUNT_Transactions_EXPORT.csv
@@ -63,24 +67,25 @@ schwab summary
 schwab positions
 ```
 
-默认数据库位于 `~/.local/share/schwab/schwab.duckdb`。也可以通过环境变量或每条
-命令的 `--db` 指定位置：
+The default database is `~/.local/share/schwab/schwab.duckdb`. Override it with
+an environment variable or the per-command `--db` option:
 
 ```bash
 export SCHWAB_DB="$PWD/data/schwab.duckdb"
 schwab summary
 
-# 等价的显式写法
+# Equivalent explicit form
 schwab summary --db data/schwab.duckdb
 ```
 
-数据库路径优先级为：`--db` > `SCHWAB_DB` > 默认路径。
-导入和重建命令可以初始化数据库；查询和分析命令严格只读，路径不存在时会返回
-`QUERY_DATABASE_ERROR`，不会创建一个看似正常的空数据库。
+Database path precedence is `--db` > `SCHWAB_DB` > the default path. Import and
+rebuild commands may initialize a database. Query and analysis commands are
+strictly read-only: a missing path returns `QUERY_DATABASE_ERROR` instead of
+creating an empty database.
 
-## 日常工作流
+## Routine workflow
 
-### 更新官方 CSV
+### Update from an official CSV
 
 ```bash
 schwab import Individual_ACCOUNT_Transactions_NEW.csv
@@ -90,10 +95,11 @@ schwab trades --limit 10
 schwab positions
 ```
 
-`import` 只更新原始交易表；`positions`、`realized` 和部分汇总依赖 FIFO 产物，
-因此 CSV 导入后必须运行 `rebuild`。两个操作都是幂等的，可以安全重复执行。
+`import` updates only the raw transaction table. `positions`, `realized`, and
+derived reports depend on FIFO products, so always run `rebuild` after a CSV
+import. Both operations are idempotent.
 
-一次导入多个文件：
+Import multiple files at once:
 
 ```bash
 schwab import \
@@ -102,18 +108,19 @@ schwab import \
 schwab rebuild
 ```
 
-命令会先验证全部文件，再开始写入。格式错误、未知 Action、金额无法勾稽或 FIFO
-数量不一致都会明确失败，不会静默跳过。
+All files are validated before writes begin. Invalid formats, unknown Actions,
+amount reconciliation failures, and FIFO quantity inconsistencies fail
+explicitly; the CLI does not silently skip them.
 
-### 导入 Gmail eConfirm
+### Import Gmail eConfirm messages
 
-`import-email` 直接接受外部获取的原始 Gmail 内容，无需转换为项目自定义格式：
+`import-email` accepts raw Gmail content without a project-specific conversion:
 
-- Gmail API `users.messages.get(format=full)` JSON；
-- Gmail API `users.messages.get(format=raw)` JSON；
-- 多个 `messages.get` 响应组成的 JSON 数组；
-- 原始 RFC 5322 `.eml`；
-- `-`，从标准输入读取上述任一格式。
+- Gmail API `users.messages.get(format=full)` JSON;
+- Gmail API `users.messages.get(format=raw)` JSON;
+- a JSON array of `messages.get` responses;
+- raw RFC 5322 `.eml`;
+- `-` to read any supported representation from standard input.
 
 ```bash
 schwab import-email gmail-econfirms.json
@@ -121,41 +128,43 @@ schwab import-email schwab-message.eml
 gmail-api-command | schwab import-email -
 ```
 
-首次向空数据库导入邮件时，必须给出完整账户标识：
+The first email import into an empty database requires the full account identifier:
 
 ```bash
 schwab import-email gmail-econfirms.json --account ACCOUNT000
 ```
 
-邮件导入默认自动执行 FIFO 重建。需要只导入原始交易时使用 `--no-rebuild`。
+Email imports rebuild FIFO by default. Use `--no-rebuild` only when you explicitly
+want to update raw transactions without refreshing derived products.
 
-eConfirm 只覆盖成交，不包含全部股息、利息、转账、税项、到期或指派记录。应定期
-导入官方 Transactions CSV，并用相同的原始邮件执行只读对账：
+eConfirm covers executions, not every dividend, interest, transfer, tax,
+expiration, or assignment record. Periodically import an official Transactions
+CSV and reconcile the original messages against the ledger:
 
 ```bash
 schwab reconcile gmail-econfirms.json
 ```
 
-`matched` 表示完全匹配，`missing` 表示数据库无对应成交，`conflict` 表示存在同日
-同合约记录但关键字段不一致。
+`matched` means an exact match, `missing` means no corresponding ledger trade,
+and `conflict` means a same-date, same-contract record differs in key fields.
 
-## 基础命令
+## Core commands
 
-| 命令 | 用途 |
+| Command | Purpose |
 |---|---|
-| `schwab import <csv...>` | 验证并幂等导入官方 CSV |
-| `schwab import-email <input...>` | 导入 Gmail API JSON 或 `.eml` |
-| `schwab reconcile <input...>` | 只读对账 Gmail eConfirm 与数据库 |
-| `schwab rebuild` | 全量重放 FIFO，重建持仓与已实现损益 |
-| `schwab audit` | 只读检查账本字段、引用及交易是否已反映到 FIFO 产物 |
-| `schwab summary` | 查看账户汇总 |
-| `schwab positions [-u SYMBOL]` | 查看当前持仓 |
-| `schwab expiring [--days N]` | 查看已过期和即将到期的期权 |
-| `schwab trades [OPTIONS]` | 查询交易流水 |
-| `schwab realized [OPTIONS]` | 查询已实现损益明细 |
-| `schwab cashflow [OPTIONS]` | 查询转账、股息、利息和税项 |
+| `schwab import <csv...>` | Validate and idempotently import official CSV files |
+| `schwab import-email <input...>` | Import Gmail API JSON or raw `.eml` |
+| `schwab reconcile <input...>` | Read-only Gmail eConfirm reconciliation |
+| `schwab rebuild` | Replay FIFO and rebuild positions and realized P&L |
+| `schwab audit` | Check fields, references, and FIFO transaction coverage |
+| `schwab summary` | Show an account summary |
+| `schwab positions [-u SYMBOL]` | Show current positions |
+| `schwab expiring [--days N]` | Show expired and upcoming options |
+| `schwab trades [OPTIONS]` | Query transaction history |
+| `schwab realized [OPTIONS]` | Query realized P&L details |
+| `schwab cashflow [OPTIONS]` | Query transfers, dividends, interest, and tax |
 
-常用查询：
+Common queries:
 
 ```bash
 schwab positions --underlying SYMBOL
@@ -165,12 +174,12 @@ schwab realized --symbol SYMBOL
 schwab cashflow --from 2030-01-01 --to 2030-12-31
 ```
 
-高级分析命令、指标定义和使用建议见
-[高级交易分析](docs/trading-analysis.md)。
+For advanced commands, metric definitions, and interpretation guidance, see
+[Advanced trading analysis](docs/trading-analysis.md).
 
-## JSON 与自动化
+## JSON and automation
 
-所有命令均可增加 `--json`：
+Every command supports `--json`:
 
 ```bash
 schwab summary --json
@@ -178,74 +187,80 @@ schwab positions --json
 schwab audit --json
 ```
 
-已知业务错误也会输出 JSON，并返回非零状态码：
+Known business errors are also emitted as JSON with a non-zero exit status:
 
 ```json
 {"ok": false, "error": {"code": "FIFO_REBUILD_ERROR", "message": "..."}}
 ```
 
-调用方应同时检查退出状态码和 JSON 内容。
+Automation should validate both the process exit status and the JSON payload.
 
-## 数据口径
+## Accounting conventions
 
-- 日期中的 `as of` 日期优先作为交易生效日。
-- 期权乘数固定为 100；股票乘数为 1。
-- FIFO 按生效日期升序重放，并保留 CSV 的同日交易顺序。
-- 开仓和平仓费用按实际消耗数量分摊至已实现损益。
-- `Expired` 和 `Assigned` 的期权腿以 `$0` 平仓；股票交割腿按 CSV 的独立
-  `Buy` / `Sell` 记录处理。
-- CSV 没有稳定交易 ID，幂等键由规范化业务字段和重复出现次数共同确定。
+- An `as of` date is used as the effective transaction date when present.
+- The option contract multiplier is 100; the stock multiplier is 1.
+- FIFO replay uses ascending effective dates and preserves same-day CSV order.
+- Opening and closing fees are allocated according to the quantity consumed.
+- `Expired` and `Assigned` option legs close at `$0`; stock delivery legs are
+  handled through their separate CSV `Buy` / `Sell` records.
+- Schwab CSV files do not provide a stable transaction ID. Idempotency uses
+  normalized business fields together with duplicate occurrence counts.
 
-更完整的分析口径及限制见[高级交易分析](docs/trading-analysis.md#统一口径与限制)。
+See [Advanced trading analysis](docs/trading-analysis.md#shared-conventions-and-limitations) for
+reporting conventions and limitations.
 
-## 故障排查
+## Troubleshooting
 
 ### `INGEST_VALIDATION_ERROR`
 
-检查文件名、CSV 表头、日期、金额、合约格式及 Action。不要通过删除错误行或修改
-金额绕过验证；遇到新 Action 时，应先增加匿名化样本和明确的账务规则。
+Check the filename, CSV header, dates, amounts, option symbols, and Action values.
+Do not delete failing rows or alter amounts to bypass validation. Add an anonymized
+fixture and an explicit accounting rule before supporting a new Action.
 
 ### `FIFO_REBUILD_ERROR`
 
-通常表示缺少更早的开仓记录、平仓数量超过持仓，或同一合约同日交易来自无法对齐
-的快照。重新导出覆盖相关日期且包含当日全部交易的官方 CSV 后再次导入。
+This normally indicates a missing earlier opening trade, a close quantity larger
+than the available position, or overlapping exports whose same-day order cannot
+be aligned. Export a complete CSV covering the affected date, import it, and run
+`rebuild` again.
 
-### 数据库被占用
+### Database locking
 
-DuckDB 文件不适合由多个写进程同时操作。关闭其他正在访问同一数据库的 CLI、
-Python 或 DuckDB 进程后重试。
+DuckDB does not support multiple concurrent writers to the same file. Close other
+CLI, Python, or DuckDB processes using the database and retry.
 
-## 数据安全与备份
+## Data security and backups
 
-交易 CSV、邮件原文、数据库和备份都包含敏感财务信息，不应提交到 Git、Issue、
-日志或公开制品。`.gitignore` 已排除常见 CSV、DuckDB、Gmail、EML、凭据、密钥及
-`application-gin.yml`，发布前仍应检查 `git status`。
+Transaction CSV files, email messages, databases, and backups contain sensitive
+financial data. Do not publish them in Git, issues, logs, or build artifacts. The
+project `.gitignore` excludes common CSV, DuckDB, Gmail, EML, credential, key, and
+`application-gin.yml` files; still inspect `git status` before publishing.
 
-关闭所有数据库连接后，可直接复制 DuckDB 文件备份：
+After closing all database connections, back up the DuckDB file directly:
 
 ```bash
 mkdir -p local-backups
 cp data/schwab.duckdb local-backups/schwab-YYYYMMDD.duckdb
 ```
 
-恢复前先备份当前数据库，再确认目标备份无误后覆盖。数据库及备份应按敏感财务
-数据管理。
+Back up the current database before restoring another copy. Treat every database
+and backup as sensitive financial data.
 
-## 开发
+## Development
 
 ```bash
 uv sync --dev
 .venv/bin/pytest
 ```
 
-项目结构：
+Project layout:
 
 ```text
-src/schwab/        CLI、导入、邮件解析、数据库和 FIFO 引擎
-tests/             合成数据回归测试
-docs/              进阶使用与分析文档
+src/schwab/        CLI, ingestion, email parsing, database, and FIFO engine
+tests/             Regression tests built from synthetic data
+docs/              Advanced usage and analysis documentation
 ```
 
 ## License
 
-本项目采用 [MIT License](LICENSE)。
+This project is licensed under the [MIT License](LICENSE).
