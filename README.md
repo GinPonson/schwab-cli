@@ -121,8 +121,10 @@ schwab rebuild
 |---|---|
 | `schwab import <csv...>` | 清洗并幂等导入 CSV(支持重叠日期快照,重复交易自动跳过) |
 | `schwab import-email <input...>` | 直接解析 Gmail API JSON 或原始 `.eml`，导入并默认重建 FIFO |
+| `schwab reconcile <input...>` | 只读对比 Gmail eConfirm 与数据库，报告匹配、缺失和冲突 |
 | `schwab rebuild` | 全量重放交易,重建 lots / realized(幂等) |
 | `schwab positions [--underlying SYMBOL]` | 当前持仓:股票股数、期权合约、成本、方向 |
+| `schwab expiring [--days 30]` | 已过期、今日到期及窗口内即将到期的期权仓位 |
 | `schwab realized [--symbol S] [--from D] [--to D]` | 已实现损益明细与合计 |
 | `schwab trades [--symbol S] [--action A] [--from D] [--to D] [-n 50]` | 交易流水查询 |
 | `schwab cashflow [--from D] [--to D]` | 出入金/股息/利息/税 |
@@ -190,6 +192,22 @@ schwab import-email gmail-econfirms.json \
 eConfirm 只覆盖成交，不能替代股息、利息、转账、税项、到期和指派等完整账户
 流水。仍应定期用官方 Transactions CSV 补全并核对账本。
 
+### Gmail 对账
+
+`reconcile` 使用与 `import-email` 相同的原始 Gmail 输入，但始终只读，不会新增
+交易或重建 FIFO：
+
+```bash
+schwab reconcile gmail-econfirms.json --db data/schwab.duckdb
+schwab reconcile schwab-message.eml --db data/schwab.duckdb --json
+```
+
+结果状态：
+
+- `matched`：日期、动作、合约、数量、价格、费用和金额均匹配；
+- `missing`：数据库中没有同日期、同合约记录；
+- `conflict`：存在同日期、同合约记录，但关键成交字段不一致。
+
 ## 查询示例
 
 ```bash
@@ -199,6 +217,12 @@ schwab summary
 # 查看全部当前持仓，或只查看一个通用标的
 schwab positions
 schwab positions --underlying SYMBOL
+
+# 检查已过期和未来 30 天内到期的期权
+schwab expiring --days 30
+
+# 使用固定基准日生成可复现报告
+schwab expiring --days 30 --as-of 2030-01-01 --json
 
 # 查看最近 100 条交易
 schwab trades --limit 100

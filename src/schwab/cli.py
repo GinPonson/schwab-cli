@@ -2,8 +2,11 @@
 
 命令一览(全部支持 --json 输出,方便 AI 消费):
     schwab import <csv...>   清洗并幂等导入嘉信交易 CSV
+    schwab import-email      从 Gmail 原始邮件导入 eConfirm
+    schwab reconcile         只读对账 Gmail eConfirm 与数据库
     schwab rebuild           全量重放 FIFO,重建持仓与已实现损益
     schwab positions         当前持仓(股票股数 + 期权合约、成本、方向)
+    schwab expiring          已过期和即将到期的期权仓位
     schwab realized          已实现损益明细与合计
     schwab trades            交易流水查询
     schwab cashflow          出入金/股息/利息/税
@@ -19,15 +22,19 @@ import hashlib
 import json
 import sys
 import tempfile
+from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
+import duckdb
 from rich.console import Console
 from rich.table import Table
 
 from . import db as dbmod
 from .email_ingest import (
+    EmailTrade,
     account_suffix,
     load_gmail_content,
     load_gmail_messages,
@@ -163,6 +170,54 @@ def _resolve_email_account(con, suffix: str, explicit_account: str | None) -> st
     )
 
 
+def _load_email_sources(
+    con, files: list[str], explicit_account: str | None,
+) -> list[tuple[str, str, list[EmailTrade], list[str]]]:
+    """读取并严格解析 Gmail 输入，供导入和只读对账共同复用。
+
+    参数:
+        con:              已打开的 DuckDB 连接，用于解析账户尾号。
+        files:            Gmail API JSON、原始 MIME 路径或单个 ``-``。
+        explicit_account: 用户显式指定的完整账户标识。
+
+    返回:
+        ``(来源名, 账户, 成交列表, Gmail message id 列表)``。
+    """
+    if files.count("-") > 1:
+        raise IngestError("标准输入 - 只能出现一次")
+    prepared: list[tuple[str, str, list[EmailTrade], list[str]]] = []
+    for source in files:
+        if source == "-":
+            stdin_stream = getattr(sys.stdin, "buffer", sys.stdin)
+            stdin_data = stdin_stream.read()
+            if isinstance(stdin_data, str):
+                stdin_data = stdin_data.encode()
+            messages = load_gmail_content(stdin_data, source_name="stdin")
+            source_name = "stdin"
+        else:
+            path = Path(source)
+            if not path.is_file():
+                raise IngestError(f"Gmail 输入文件不存在: {source}")
+            messages = load_gmail_messages(path)
+            source_name = str(path)
+        suffixes = {account_suffix(message) for message in messages}
+        if len(suffixes) != 1:
+            raise IngestError(
+                f"{source_name}: 单个输入包含多个 Schwab 账户: {sorted(suffixes)}"
+            )
+        resolved_account = _resolve_email_account(con, suffixes.pop(), explicit_account)
+        trades: list[EmailTrade] = []
+        for message in messages:
+            trades.extend(parse_econfirm(message))
+        # 官方 CSV 是日期倒序；稳定排序保留同日邮件内的展示顺序。
+        trades.sort(key=lambda trade: trade.trade_date, reverse=True)
+        prepared.append((
+            source_name, resolved_account, trades,
+            [message.message_id for message in messages],
+        ))
+    return prepared
+
+
 @app.command(name="import-email")
 def import_email_cmd(
     files: Annotated[list[str], typer.Argument(
@@ -179,40 +234,9 @@ def import_email_cmd(
 ) -> None:
     """直接解析 Gmail API JSON 或原始 MIME 中的 eConfirm 并幂等导入。"""
     con = dbmod.connect(str(db) if db else None)
-    prepared: list[tuple[str, str, list, list[str]]] = []
     try:
         # 先解析并校验全部输入，任一邮件异常时不导入任何文件。
-        if files.count("-") > 1:
-            raise IngestError("标准输入 - 只能出现一次")
-        for source in files:
-            if source == "-":
-                stdin_stream = getattr(sys.stdin, "buffer", sys.stdin)
-                stdin_data = stdin_stream.read()
-                if isinstance(stdin_data, str):
-                    stdin_data = stdin_data.encode()
-                messages = load_gmail_content(stdin_data, source_name="stdin")
-                source_name = "stdin"
-            else:
-                path = Path(source)
-                if not path.is_file():
-                    raise IngestError(f"Gmail 输入文件不存在: {source}")
-                messages = load_gmail_messages(path)
-                source_name = str(path)
-            suffixes = {account_suffix(message) for message in messages}
-            if len(suffixes) != 1:
-                raise IngestError(
-                    f"{source_name}: 单个输入包含多个 Schwab 账户: {sorted(suffixes)}"
-                )
-            resolved_account = _resolve_email_account(con, suffixes.pop(), account)
-            trades = []
-            for message in messages:
-                trades.extend(parse_econfirm(message))
-            # 官方 CSV 是日期倒序；Python 稳定排序会保留邮件内成交展示顺序。
-            trades.sort(key=lambda trade: trade.trade_date, reverse=True)
-            prepared.append((
-                source_name, resolved_account, trades,
-                [message.message_id for message in messages],
-            ))
+        prepared = _load_email_sources(con, files, account)
     except IngestError as exc:
         _exit_error(code="EMAIL_INGEST_VALIDATION_ERROR", message=str(exc), as_json=as_json)
 
@@ -258,6 +282,87 @@ def import_email_cmd(
 
 
 @app.command()
+def reconcile(
+    files: Annotated[list[str], typer.Argument(
+        help="用于对账的 Gmail API JSON、原始 .eml，或用 - 从 stdin 读取"
+    )],
+    db: DbOption = None,
+    as_json: JsonOption = False,
+    account: Annotated[Optional[str], typer.Option(
+        "--account", help="完整账户标识；数据库尾号不唯一时必填"
+    )] = None,
+) -> None:
+    """只读比较 Gmail eConfirm 与数据库交易，不写入或重建。"""
+    try:
+        con = dbmod.connect_read_only(str(db) if db else None)
+    except (FileNotFoundError, duckdb.Error) as exc:
+        # DuckDB 只读打开错误统一转换为稳定 CLI 协议，避免输出 traceback。
+        _exit_error(code="EMAIL_RECONCILE_ERROR", message=str(exc), as_json=as_json)
+    try:
+        prepared = _load_email_sources(con, files, account)
+    except IngestError as exc:
+        _exit_error(code="EMAIL_RECONCILE_ERROR", message=str(exc), as_json=as_json)
+
+    rows: list[dict] = []
+    consumed: dict[tuple, int] = {}
+    for source_name, resolved_account, trades, _ in prepared:
+        for trade in trades:
+            key = (
+                resolved_account, trade.trade_date, trade.action, trade.symbol,
+                trade.quantity, trade.price, trade.fees, trade.amount,
+            )
+            exact = con.execute(
+                """
+                SELECT txn_hash FROM transactions
+                WHERE account = ? AND txn_date = ? AND action = ? AND raw_symbol = ?
+                  AND quantity = ? AND price = ? AND coalesce(fees, 0) = ? AND amount = ?
+                ORDER BY txn_hash
+                """,
+                list(key),
+            ).fetchall()
+            occurrence = consumed.get(key, 0)
+            if occurrence < len(exact):
+                status = "matched"
+                txn_hash = exact[occurrence][0]
+                consumed[key] = occurrence + 1
+                candidates = 1
+            else:
+                loose = con.execute(
+                    """
+                    SELECT txn_hash FROM transactions
+                    WHERE account = ? AND txn_date = ? AND raw_symbol = ?
+                    ORDER BY txn_hash
+                    """,
+                    [resolved_account, trade.trade_date, trade.symbol],
+                ).fetchall()
+                status = "conflict" if loose else "missing"
+                txn_hash = None
+                candidates = len(loose)
+            rows.append({
+                "status": status,
+                "source": source_name,
+                "txn_date": trade.trade_date,
+                "action": trade.action,
+                "symbol": trade.symbol,
+                "quantity": trade.quantity,
+                "price": trade.price,
+                "fees": trade.fees,
+                "amount": trade.amount,
+                "txn_hash": txn_hash,
+                "candidates": candidates,
+            })
+    counts = {status: sum(row["status"] == status for row in rows)
+              for status in ("matched", "missing", "conflict")}
+    _emit(
+        rows,
+        ["status", "txn_date", "action", "symbol", "quantity", "price", "fees", "amount"],
+        "Gmail / 数据库对账",
+        as_json,
+        extra={"count": len(rows), **counts, "read_only": True},
+    )
+
+
+@app.command()
 def rebuild(db: DbOption = None, as_json: JsonOption = False) -> None:
     """全量重放交易,重建 lots / realized(幂等)。"""
     con = dbmod.connect(str(db) if db else None)
@@ -295,6 +400,64 @@ def positions(
     _emit(rows, ["underlying", "symbol_key", "asset_type", "direction", "qty", "cost",
                  "expiry", "strike", "option_type", "first_open_date"],
           "当前持仓", as_json, extra={"count": len(rows)})
+
+
+@app.command()
+def expiring(
+    db: DbOption = None,
+    as_json: JsonOption = False,
+    days: Annotated[int, typer.Option(
+        "--days", "-d", help="列出未来多少天内到期的期权，同时包含已过期未平仓"
+    )] = 30,
+    as_of: Annotated[Optional[str], typer.Option(
+        "--as-of", help="分析基准日 YYYY-MM-DD，默认今天"
+    )] = None,
+) -> None:
+    """列出已过期、今日到期和即将到期的未平期权仓位。"""
+    if days < 0:
+        _exit_error(code="INVALID_ARGUMENT", message="--days 不能为负数", as_json=as_json)
+    try:
+        analysis_date = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError:
+        _exit_error(
+            code="INVALID_ARGUMENT", message=f"无法解析 --as-of 日期: {as_of!r}",
+            as_json=as_json,
+        )
+    cutoff = analysis_date + timedelta(days=days)
+    con = dbmod.connect(str(db) if db else None)
+    rows = _query(
+        con,
+        """
+        SELECT account, symbol_key, underlying, direction, qty, cost,
+               expiry, strike, option_type, first_open_date
+        FROM v_positions
+        WHERE asset_type = 'option' AND expiry <= ?
+        ORDER BY expiry, underlying, strike, direction
+        """,
+        [cutoff],
+    )
+    counts = {"expired": 0, "expires_today": 0, "upcoming": 0}
+    for row in rows:
+        remaining = (row["expiry"] - analysis_date).days
+        if remaining < 0:
+            status = "expired"
+        elif remaining == 0:
+            status = "expires_today"
+        else:
+            status = "upcoming"
+        counts[status] += 1
+        row["status"] = status
+        row["days_remaining"] = remaining
+        # v_positions.cost 是合约权利金报价 × 数量；换算成美元需乘标准乘数 100。
+        row["premium_dollars"] = (row["cost"] * Decimal(100)).quantize(Decimal("0.01"))
+    _emit(
+        rows,
+        ["status", "days_remaining", "symbol_key", "direction", "qty",
+         "premium_dollars", "expiry", "first_open_date"],
+        f"到期期权（基准日 {analysis_date}，未来 {days} 天）",
+        as_json,
+        extra={"count": len(rows), "as_of": analysis_date, "cutoff": cutoff, **counts},
+    )
 
 
 @app.command()

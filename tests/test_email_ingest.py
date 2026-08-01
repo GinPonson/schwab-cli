@@ -317,3 +317,46 @@ def test_import_email_cli_imports_and_is_idempotent(tmp_path):
         "Sell to Open", "INTC 07/31/2026 120.00 C",
         Decimal("0.660000"), Decimal("228.3400"),
     )
+
+
+def test_reconcile_reports_matched_and_missing_without_writing(tmp_path):
+    """reconcile 应逐笔报告匹配状态，且不得向空数据库写入邮件交易。"""
+    body = _trade_block(
+        symbol="INTC 07/31/2026 120.00 C",
+        description="INTEL CORP 07/31/2026 $120 Call",
+        action="Sale", position_type="Short",
+        quantity="1", price="2.29", principal="229.00", fees="0.66", amount="228.34",
+    )
+    path = tmp_path / "gmail.json"
+    path.write_text(json.dumps({
+        "id": "message-1",
+        "from_": "Schwab Alerts donotreply@mail.schwab.com",
+        "subject": "Schwab eConfirms account ending in 276",
+        "body": "Account ending: 276" + body,
+    }), encoding="utf-8")
+    populated_db = tmp_path / "populated.duckdb"
+    imported = runner.invoke(app, [
+        "import-email", str(path), "--account", "TST276", "--no-rebuild",
+        "--db", str(populated_db), "--json",
+    ])
+    assert imported.exit_code == 0, imported.stdout
+
+    matched = runner.invoke(app, [
+        "reconcile", str(path), "--db", str(populated_db), "--json",
+    ])
+    empty_db = tmp_path / "empty.duckdb"
+    # reconcile 只读打开已有数据库；先创建一个空账本，再验证不会写入交易。
+    empty_con = dbmod.connect(str(empty_db))
+    empty_con.close()
+    missing = runner.invoke(app, [
+        "reconcile", str(path), "--account", "TST276", "--db", str(empty_db), "--json",
+    ])
+
+    assert matched.exit_code == 0, matched.stdout
+    assert json.loads(matched.stdout)["matched"] == 1
+    missing_payload = json.loads(missing.stdout)
+    assert missing.exit_code == 0, missing.stdout
+    assert missing_payload["missing"] == 1
+    con = dbmod.connect(str(empty_db))
+    assert con.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+    con.close()

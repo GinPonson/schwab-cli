@@ -45,3 +45,26 @@ def test_rebuild_json_error_is_structured(tmp_path):
     payload = json.loads(result.stdout)
     assert payload["ok"] is False
     assert payload["error"]["code"] == "FIFO_REBUILD_ERROR"
+
+
+def test_expiring_classifies_expired_and_upcoming_positions(tmp_path):
+    """expiring 应相对基准日区分已过期与窗口内即将到期仓位。"""
+    path = write_csv(tmp_path, [
+        '"07/02/2026","Buy to Open","OLD 07/31/2026 100.00 C","CALL OLD $100 EXP 07/31/26","1","$1.00","$0.66","-$100.66"',
+        '"07/01/2026","Buy to Open","NEW 08/15/2026 100.00 C","CALL NEW $100 EXP 08/15/26","2","$2.00","$1.31","-$401.31"',
+    ])
+    db_path = tmp_path / "expiring.duckdb"
+    assert runner.invoke(app, ["import", str(path), "--db", str(db_path)]).exit_code == 0
+    assert runner.invoke(app, ["rebuild", "--db", str(db_path)]).exit_code == 0
+
+    result = runner.invoke(app, [
+        "expiring", "--days", "30", "--as-of", "2026-08-01",
+        "--db", str(db_path), "--json",
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["expired"] == 1
+    assert payload["upcoming"] == 1
+    assert payload["expires_today"] == 0
+    assert payload["rows"][0]["days_remaining"] == -1

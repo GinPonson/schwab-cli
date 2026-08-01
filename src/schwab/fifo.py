@@ -283,7 +283,10 @@ def rebuild(con) -> dict:
         "transactions_replayed": len(rows),
         "open_lots": len(open_lots),
         "realized_records": len(realized),
-        "total_realized_pnl": str(sum(r["pnl"] for r in realized).quantize(Decimal("0.0001"))),
+        # 显式提供 Decimal 起始值，避免尚无已实现交易时 sum([]) 返回整数 0。
+        "total_realized_pnl": str(
+            sum((r["pnl"] for r in realized), Decimal(0)).quantize(Decimal("0.0001"))
+        ),
         "warnings": warnings,
     }
 

@@ -144,3 +144,18 @@ def connect(db: str | None = None) -> duckdb.DuckDBPyConnection:
     con.execute(SCHEMA_SQL)
     con.execute(VIEWS_SQL)
     return con
+
+
+def connect_read_only(db: str | None = None) -> duckdb.DuckDBPyConnection:
+    """以只读模式打开已有数据库，禁止查询命令产生任何持久化修改。
+
+    参数:
+        db: 显式数据库路径；为空时沿用 ``resolve_db_path`` 的解析顺序。
+
+    返回:
+        DuckDB 只读连接。目标文件不存在时直接报错，不自动创建空数据库。
+    """
+    path = resolve_db_path(db)
+    if not path.is_file():
+        raise FileNotFoundError(f"数据库不存在: {path}")
+    return duckdb.connect(str(path), read_only=True)
