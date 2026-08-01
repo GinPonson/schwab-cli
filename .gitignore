@@ -1,0 +1,11 @@
+# Python / uv
+__pycache__/
+*.pyc
+.venv/
+dist/
+
+# 本地数据库与个人财务数据,一律不入库
+data/
+*.duckdb
+*.duckdb.wal
+*.csv

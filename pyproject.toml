@@ -1,0 +1,27 @@
+[project]
+name = "schwab"
+version = "0.1.0"
+description = "嘉信(Schwab)个人交易记录 CLI:CSV 清洗导入 DuckDB,FIFO 持仓与已实现损益"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.1",
+    "typer>=0.12",
+]
+
+[project.scripts]
+schwab = "schwab.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/schwab"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "src"]
