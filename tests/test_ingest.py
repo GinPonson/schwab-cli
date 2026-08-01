@@ -134,3 +134,84 @@ class TestImport:
             '"10/28/2025 as of 10/27/2025","MoneyLink Transfer","","Tfr WISE","","","","$5.00"',
         ])
         assert import_csv(con, path)["inserted"] == 2
+
+    def test_overlapping_export_deduplicates_when_seq_changes(self, tmp_path, con):
+        """后续导出增加新行时，历史交易即使行号变化也不得重复入账。"""
+        old_path = write_csv(
+            tmp_path,
+            ['"07/28/2026","Buy","INTC","INTEL CORP","10","$85.23","","-$852.30"'],
+            name="Individual_TST001_Transactions_20260728-000000.csv",
+        )
+        new_path = write_csv(
+            tmp_path,
+            [
+                '"07/29/2026","Qualified Dividend","INTC","INTEL CORP","","","","$5.00"',
+                '"07/28/2026","Buy","INTC","INTEL CORP","10","$85.23","","-$852.30"',
+            ],
+            name="Individual_TST001_Transactions_20260729-000000.csv",
+        )
+
+        assert import_csv(con, old_path)["inserted"] == 1
+        stats = import_csv(con, new_path)
+
+        assert stats["inserted"] == 1
+        assert stats["skipped"] == 1
+        assert con.execute("SELECT count(*) FROM transactions").fetchone()[0] == 2
+
+    def test_overlapping_export_preserves_identical_transaction_count(self, tmp_path, con):
+        """完全相同的真实交易按出现次数去重，而不是合并成一笔。"""
+        row = '"10/28/2025 as of 10/27/2025","MoneyLink Transfer","","Tfr WISE","","","","$5.00"'
+        old_path = write_csv(
+            tmp_path, [row],
+            name="Individual_TST001_Transactions_20251028-000000.csv",
+        )
+        new_path = write_csv(
+            tmp_path, [row, row],
+            name="Individual_TST001_Transactions_20251029-000000.csv",
+        )
+
+        import_csv(con, old_path)
+        stats = import_csv(con, new_path)
+
+        assert stats["inserted"] == 1
+        assert stats["skipped"] == 1
+        assert con.execute("SELECT count(*) FROM transactions").fetchone()[0] == 2
+
+    def test_every_valid_file_is_registered_with_total_rows(self, tmp_path, con):
+        """重复文件也应留存导入审计记录，row_count 始终表示文件总行数。"""
+        path = write_csv(tmp_path, [
+            '"07/28/2026","Buy","INTC","INTEL CORP","10","$85.23","","-$852.30"',
+        ])
+        import_csv(con, path)
+        import_csv(con, path)
+
+        assert con.execute(
+            "SELECT row_count FROM import_files WHERE file_name = ?", [path.name]
+        ).fetchone()[0] == 1
+
+    def test_database_failure_rolls_back_whole_file(self, tmp_path, con):
+        """任一行写库失败时，前面已插入的行及文件登记都必须回滚。"""
+        path = write_csv(tmp_path, [
+            '"07/29/2026","Buy","WMT","WALMART INC","1","$100.00","","-$100.00"',
+            '"07/28/2026","Buy","INTC","INTEL CORP","10","$85.23","","-$852.30"',
+        ])
+
+        class FailingConnection:
+            """在第二条交易写入时注入数据库异常的最小连接代理。"""
+
+            def __init__(self, connection):
+                self.connection = connection
+                self.transaction_inserts = 0
+
+            def execute(self, sql, params=None):
+                if sql.lstrip().startswith("INSERT OR IGNORE INTO transactions"):
+                    self.transaction_inserts += 1
+                    if self.transaction_inserts == 2:
+                        raise RuntimeError("injected database failure")
+                return self.connection.execute(sql, params or [])
+
+        with pytest.raises(RuntimeError, match="injected database failure"):
+            import_csv(FailingConnection(con), path)
+
+        assert con.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+        assert con.execute("SELECT count(*) FROM import_files").fetchone()[0] == 0

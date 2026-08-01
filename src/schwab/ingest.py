@@ -12,8 +12,8 @@
   |amount| == qty * price * mult - fees (误差 <= 0.011),符号与买卖方向一致
 - 未知 Action、金额异常、格式异常一律抛 IngestError 中止,不静默跳过
 
-幂等:txn_hash = 规范化行内容(含文件内行号 seq)的 sha256,
-导入时 INSERT OR IGNORE,重复行自动跳过。
+幂等:txn_hash = 规范化业务字段 + 相同记录出现次数的 sha256，不依赖文件内
+行号；重叠日期范围的后续导出可安全增量导入。每个文件使用独立数据库事务。
 """
 
 from __future__ import annotations
@@ -21,7 +21,8 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -83,17 +84,32 @@ class ParsedTxn:
     amount: Decimal | None
     source_hash: str
     seq: int
+    occurrence: int = field(default=1)
+
+    @staticmethod
+    def _hash_value(value: object | None) -> str:
+        """把字段转换为稳定哈希文本，显式区分 NULL 与数值 0。"""
+        return "<NULL>" if value is None else str(value)
+
+    @property
+    def business_hash(self) -> str:
+        """返回不依赖文件名和行号的交易业务指纹。
+
+        嘉信 CSV 不提供稳定交易 ID，因此使用全部原始业务字段构造指纹。
+        完全相同的多笔真实交易再由 occurrence 区分。
+        """
+        parts = [
+            self.account, str(self.record_date), str(self.txn_date), self.action,
+            self._hash_value(self.raw_symbol), self._hash_value(self.description),
+            self._hash_value(self.quantity), self._hash_value(self.price),
+            self._hash_value(self.fees), self._hash_value(self.amount),
+        ]
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
     @property
     def txn_hash(self) -> str:
-        """规范化行内容哈希(含 seq),同一文件重复导入结果一致,行级幂等。"""
-        parts = [
-            self.account, str(self.record_date), str(self.txn_date), self.action,
-            self.raw_symbol or "", self.description or "",
-            str(self.quantity or ""), str(self.price or ""),
-            str(self.fees or ""), str(self.amount or ""), str(self.seq),
-        ]
-        return hashlib.sha256("|".join(parts).encode()).hexdigest()
+        """返回稳定交易哈希，不受后续导出导致的 CSV 行号变化影响。"""
+        return hashlib.sha256(f"{self.business_hash}|{self.occurrence}".encode()).hexdigest()
 
 
 def parse_money(raw: str) -> Decimal | None:
@@ -244,6 +260,7 @@ def parse_csv(path: Path) -> tuple[str, str, list[ParsedTxn]]:
     account = parse_account(path.name)
     digest = file_digest(path)
     txns: list[ParsedTxn] = []
+    occurrences: Counter[str] = Counter()
     with path.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         expected = ["Date", "Action", "Symbol", "Description", "Quantity", "Price", "Fees & Comm", "Amount"]
@@ -252,42 +269,79 @@ def parse_csv(path: Path) -> tuple[str, str, list[ParsedTxn]]:
         # seq 从 1 开始(数据首行),保持与文件中物理行序一致
         for seq, row in enumerate(reader, start=1):
             where = f"{path.name} 第{seq}行"
-            txns.append(parse_row(row, account=account, source_hash=digest, seq=seq, where=where))
+            txn = parse_row(row, account=account, source_hash=digest, seq=seq, where=where)
+            # 相同业务字段可能代表多笔真实交易；按其在快照中的出现次数稳定编号。
+            occurrences[txn.business_hash] += 1
+            txn.occurrence = occurrences[txn.business_hash]
+            txns.append(txn)
     return account, digest, txns
 
 
 def import_csv(con, path: Path) -> dict:
     """把单个 CSV 导入 transactions 表,返回统计信息。
 
-    行级幂等:已存在的 txn_hash 自动跳过;文件级登记 import_files 仅在
-    有新增行时更新。
+    跨快照幂等:按业务字段及相同记录出现次数去重；整个文件在一个事务内
+    写入，任意数据库异常都会回滚。
     """
     account, digest, txns = parse_csv(path)
     inserted = 0
     by_action: dict[str, int] = {}
-    for txn in txns:
-        # INSERT OR IGNORE:txn_hash 主键冲突(重复导入)时静默跳过该行
-        result = con.execute(
-            """
-            INSERT OR IGNORE INTO transactions (
-                txn_hash, account, record_date, txn_date, action, raw_symbol,
-                description, asset_type, underlying, expiry, strike, option_type,
-                quantity, price, fees, amount, source_hash, seq
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING txn_hash
-            """,
-            [
-                txn.txn_hash, txn.account, txn.record_date, txn.txn_date, txn.action,
-                txn.raw_symbol, txn.description, txn.asset_type, txn.underlying,
-                txn.expiry, txn.strike, txn.option_type, txn.quantity, txn.price,
-                txn.fees, txn.amount, txn.source_hash, txn.seq,
-            ],
-        ).fetchone()
-        if result is not None:
-            inserted += 1
-            by_action[txn.action] = by_action.get(txn.action, 0) + 1
 
-    if inserted:
+    con.execute("BEGIN TRANSACTION")
+    try:
+        # 兼容第一版数据库：旧 txn_hash 含 seq，不能直接依赖主键判断跨文件重复。
+        # 查询完整业务字段相同的已有记录，并按 occurrence 一一对应。
+        existing_rows: dict[str, list[str]] = {}
+        unique_txns = {txn.business_hash: txn for txn in txns}
+        for business_hash, txn in unique_txns.items():
+            rows = con.execute(
+                """
+                SELECT txn_hash FROM transactions
+                WHERE account = ? AND record_date = ? AND txn_date = ? AND action = ?
+                  AND raw_symbol IS NOT DISTINCT FROM ?
+                  AND description IS NOT DISTINCT FROM ?
+                  AND quantity IS NOT DISTINCT FROM ?
+                  AND price IS NOT DISTINCT FROM ?
+                  AND fees IS NOT DISTINCT FROM ?
+                  AND amount IS NOT DISTINCT FROM ?
+                ORDER BY txn_hash
+                """,
+                [txn.account, txn.record_date, txn.txn_date, txn.action, txn.raw_symbol,
+                 txn.description, txn.quantity, txn.price, txn.fees, txn.amount],
+            ).fetchall()
+            existing_rows[business_hash] = [row[0] for row in rows]
+
+        for txn in txns:
+            matched = existing_rows[txn.business_hash]
+            if txn.occurrence <= len(matched):
+                # 用最新快照重新锚定文件内顺序；这样重叠导出新增同日交易时，
+                # 已有交易和新增交易仍共享同一条可比较的顺序轴。
+                con.execute(
+                    "UPDATE transactions SET source_hash = ?, seq = ? WHERE txn_hash = ?",
+                    [txn.source_hash, txn.seq, matched[txn.occurrence - 1]],
+                )
+                continue
+            result = con.execute(
+                """
+                INSERT OR IGNORE INTO transactions (
+                    txn_hash, account, record_date, txn_date, action, raw_symbol,
+                    description, asset_type, underlying, expiry, strike, option_type,
+                    quantity, price, fees, amount, source_hash, seq
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING txn_hash
+                """,
+                [
+                    txn.txn_hash, txn.account, txn.record_date, txn.txn_date, txn.action,
+                    txn.raw_symbol, txn.description, txn.asset_type, txn.underlying,
+                    txn.expiry, txn.strike, txn.option_type, txn.quantity, txn.price,
+                    txn.fees, txn.amount, txn.source_hash, txn.seq,
+                ],
+            ).fetchone()
+            if result is not None:
+                inserted += 1
+                by_action[txn.action] = by_action.get(txn.action, 0) + 1
+
+        # 所有已成功解析的文件均登记，row_count 表示文件总行数而非新增行数。
         con.execute(
             """
             INSERT INTO import_files (file_hash, file_name, account, row_count)
@@ -295,8 +349,13 @@ def import_csv(con, path: Path) -> dict:
             ON CONFLICT (file_hash) DO UPDATE SET
                 imported_at = now(), row_count = excluded.row_count
             """,
-            [digest, path.name, account, inserted],
+            [digest, path.name, account, len(txns)],
         )
+        con.execute("COMMIT")
+    except Exception:
+        # 数据库错误必须整体回滚，禁止留下半个文件的交易记录。
+        con.execute("ROLLBACK")
+        raise
 
     return {
         "file": path.name,

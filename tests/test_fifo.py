@@ -154,3 +154,50 @@ class TestRebuildIdempotent:
         assert first["realized_records"] == second["realized_records"]
         assert first["total_realized_pnl"] == second["total_realized_pnl"] == "200.0000"
         assert con.execute("SELECT count(*) FROM realized").fetchone()[0] == 1
+
+    def test_database_failure_preserves_previous_rebuild(self, tmp_path, con):
+        """重建写入失败时，不得清空上一版有效的 lots/realized 结果。"""
+        path = write_csv(tmp_path, [
+            '"01/10/2026","Sell","INTC","INTEL CORP","10","$60.00","","$600.00"',
+            '"01/05/2026","Buy","INTC","INTEL CORP","10","$40.00","","-$400.00"',
+        ])
+        import_csv(con, path)
+        rebuild(con)
+
+        class FailingConnection:
+            """在写入新 realized 记录时注入数据库异常的最小连接代理。"""
+
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, sql, params=None):
+                if sql.lstrip().startswith("INSERT INTO realized"):
+                    raise RuntimeError("injected rebuild failure")
+                return self.connection.execute(sql, params or [])
+
+        with pytest.raises(RuntimeError, match="injected rebuild failure"):
+            rebuild(FailingConnection(con))
+
+        rows = con.execute("SELECT pnl FROM realized").fetchall()
+        assert rows == [(Decimal("200.0000"),)]
+
+
+class TestReplayOrdering:
+    """跨文件同日顺序必须可证明，不能使用不可比较的文件行号猜测。"""
+
+    def test_same_symbol_same_day_from_unaligned_files_raises(self, tmp_path, con):
+        buy_path = write_csv(
+            tmp_path,
+            ['"01/05/2026","Buy","INTC","INTEL CORP","10","$40.00","","-$400.00"'],
+            name="Individual_TST001_Transactions_20260105-010000.csv",
+        )
+        sell_path = write_csv(
+            tmp_path,
+            ['"01/05/2026","Sell","INTC","INTEL CORP","10","$60.00","","$600.00"'],
+            name="Individual_TST001_Transactions_20260105-020000.csv",
+        )
+        import_csv(con, buy_path)
+        import_csv(con, sell_path)
+
+        with pytest.raises(FifoError, match="未对齐的 CSV 快照"):
+            rebuild(con)

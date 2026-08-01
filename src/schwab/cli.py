@@ -15,7 +15,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import sys
+import tempfile
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -24,8 +27,15 @@ from rich.console import Console
 from rich.table import Table
 
 from . import db as dbmod
-from .fifo import rebuild as fifo_rebuild
-from .ingest import IngestError, import_csv
+from .email_ingest import (
+    account_suffix,
+    load_gmail_content,
+    load_gmail_messages,
+    parse_econfirm,
+    write_transactions_csv,
+)
+from .fifo import FifoError, rebuild as fifo_rebuild
+from .ingest import IngestError, import_csv, parse_csv
 
 app = typer.Typer(help="嘉信(Schwab)个人交易记录:导入、FIFO 持仓与损益查询", no_args_is_help=True)
 console = Console()
@@ -71,6 +81,22 @@ def _query(con, sql: str, params: list | None = None) -> list[dict]:
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
+def _exit_error(*, code: str, message: str, as_json: bool) -> None:
+    """以稳定协议输出已知业务错误并使用非零状态码退出。
+
+    参数:
+        code:     供 AI 或脚本判断错误类型的稳定代码。
+        message:  面向用户的完整错误信息。
+        as_json:  为 True 时把结构化错误写到 stdout，否则写到 stderr。
+    """
+    if as_json:
+        typer.echo(json.dumps({"ok": False, "error": {"code": code, "message": message}},
+                              ensure_ascii=False))
+    else:
+        err_console.print(f"[red]{code}[/] {message}")
+    raise typer.Exit(code=1)
+
+
 @app.command(name="import")
 def import_cmd(
     files: Annotated[list[Path], typer.Argument(help="嘉信导出的 Transactions CSV(可多个)", exists=True)],
@@ -80,12 +106,18 @@ def import_cmd(
     """清洗 CSV 并幂等导入 transactions 表(导入后需 rebuild 刷新持仓)。"""
     con = dbmod.connect(str(db) if db else None)
     results = []
+    # 先验证全部文件，避免第二个文件格式错误时第一个文件已经写入。
+    try:
+        for path in files:
+            parse_csv(path)
+    except IngestError as exc:
+        _exit_error(code="INGEST_VALIDATION_ERROR", message=str(exc), as_json=as_json)
+
     for path in files:
         try:
             results.append(import_csv(con, path))
-        except IngestError as e:
-            err_console.print(f"[red]导入失败[/] {path.name}: {e}")
-            raise typer.Exit(code=1)
+        except IngestError as exc:
+            _exit_error(code="INGEST_VALIDATION_ERROR", message=str(exc), as_json=as_json)
     if as_json:
         typer.echo(json.dumps({"files": results}, ensure_ascii=False, default=str))
     else:
@@ -99,11 +131,140 @@ def import_cmd(
         console.print("提示:持仓与损益需运行 `schwab rebuild` 刷新")
 
 
+def _resolve_email_account(con, suffix: str, explicit_account: str | None) -> str:
+    """把邮件账户尾号解析为 CLI 使用的完整匿名账户标识。
+
+    参数:
+        con:              已打开的 DuckDB 连接。
+        suffix:           eConfirm 正文中的账户尾号。
+        explicit_account: 用户通过 ``--account`` 指定的账户；为空时从现有交易解析。
+
+    返回:
+        与现有数据库一致的完整账户标识。
+    """
+    if explicit_account:
+        if not explicit_account.endswith(suffix):
+            raise IngestError(
+                f"--account {explicit_account!r} 与邮件账户尾号 {suffix!r} 不匹配"
+            )
+        return explicit_account
+    rows = con.execute(
+        "SELECT DISTINCT account FROM transactions WHERE right(account, ?) = ? ORDER BY account",
+        [len(suffix), suffix],
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0][0]
+    if not rows:
+        raise IngestError(
+            f"数据库中没有尾号为 {suffix!r} 的账户；首次邮件导入必须提供 --account"
+        )
+    raise IngestError(
+        f"数据库中有多个尾号为 {suffix!r} 的账户；请使用 --account 明确指定"
+    )
+
+
+@app.command(name="import-email")
+def import_email_cmd(
+    files: Annotated[list[str], typer.Argument(
+        help="Gmail API JSON、原始 .eml，或用 - 从 stdin 读取"
+    )],
+    db: DbOption = None,
+    as_json: JsonOption = False,
+    account: Annotated[Optional[str], typer.Option(
+        "--account", help="完整账户标识；首次导入或尾号不唯一时必填"
+    )] = None,
+    rebuild_after: Annotated[bool, typer.Option(
+        "--rebuild/--no-rebuild", help="导入成功后立即重建 FIFO 持仓与损益"
+    )] = True,
+) -> None:
+    """直接解析 Gmail API JSON 或原始 MIME 中的 eConfirm 并幂等导入。"""
+    con = dbmod.connect(str(db) if db else None)
+    prepared: list[tuple[str, str, list, list[str]]] = []
+    try:
+        # 先解析并校验全部输入，任一邮件异常时不导入任何文件。
+        if files.count("-") > 1:
+            raise IngestError("标准输入 - 只能出现一次")
+        for source in files:
+            if source == "-":
+                stdin_stream = getattr(sys.stdin, "buffer", sys.stdin)
+                stdin_data = stdin_stream.read()
+                if isinstance(stdin_data, str):
+                    stdin_data = stdin_data.encode()
+                messages = load_gmail_content(stdin_data, source_name="stdin")
+                source_name = "stdin"
+            else:
+                path = Path(source)
+                if not path.is_file():
+                    raise IngestError(f"Gmail 输入文件不存在: {source}")
+                messages = load_gmail_messages(path)
+                source_name = str(path)
+            suffixes = {account_suffix(message) for message in messages}
+            if len(suffixes) != 1:
+                raise IngestError(
+                    f"{source_name}: 单个输入包含多个 Schwab 账户: {sorted(suffixes)}"
+                )
+            resolved_account = _resolve_email_account(con, suffixes.pop(), account)
+            trades = []
+            for message in messages:
+                trades.extend(parse_econfirm(message))
+            # 官方 CSV 是日期倒序；Python 稳定排序会保留邮件内成交展示顺序。
+            trades.sort(key=lambda trade: trade.trade_date, reverse=True)
+            prepared.append((
+                source_name, resolved_account, trades,
+                [message.message_id for message in messages],
+            ))
+    except IngestError as exc:
+        _exit_error(code="EMAIL_INGEST_VALIDATION_ERROR", message=str(exc), as_json=as_json)
+
+    results = []
+    with tempfile.TemporaryDirectory(prefix="schwab-email-") as temp_dir:
+        for source_name, resolved_account, trades, message_ids in prepared:
+            id_hash = hashlib.sha256("|".join(message_ids).encode()).hexdigest()[:16]
+            csv_path = Path(temp_dir) / (
+                f"Individual_{resolved_account}_Transactions_GMAIL_{id_hash}.csv"
+            )
+            write_transactions_csv(csv_path, trades)
+            try:
+                result = import_csv(con, csv_path)
+            except IngestError as exc:
+                _exit_error(code="EMAIL_INGEST_VALIDATION_ERROR", message=str(exc), as_json=as_json)
+            result["source"] = source_name
+            result["gmail_messages"] = len(message_ids)
+            results.append(result)
+
+    rebuild_stats = None
+    if rebuild_after:
+        try:
+            rebuild_stats = fifo_rebuild(con)
+        except FifoError as exc:
+            _exit_error(code="FIFO_REBUILD_ERROR", message=str(exc), as_json=as_json)
+
+    if as_json:
+        typer.echo(json.dumps(
+            {"files": results, "rebuild": rebuild_stats}, ensure_ascii=False, default=str
+        ))
+        return
+    for result in results:
+        console.print(
+            f"{result['source']} (账户 {result['account']}): "
+            f"Gmail {result['gmail_messages']} 封，共 {result['total_rows']} 笔，"
+            f"新增 {result['inserted']}，跳过重复 {result['skipped']}"
+        )
+    if rebuild_stats is not None:
+        console.print(
+            f"FIFO 已重建：重放 {rebuild_stats['transactions_replayed']} 条交易，"
+            f"未平批次 {rebuild_stats['open_lots']}，已实现记录 {rebuild_stats['realized_records']}"
+        )
+
+
 @app.command()
 def rebuild(db: DbOption = None, as_json: JsonOption = False) -> None:
     """全量重放交易,重建 lots / realized(幂等)。"""
     con = dbmod.connect(str(db) if db else None)
-    stats = fifo_rebuild(con)
+    try:
+        stats = fifo_rebuild(con)
+    except FifoError as exc:
+        _exit_error(code="FIFO_REBUILD_ERROR", message=str(exc), as_json=as_json)
     if as_json:
         typer.echo(json.dumps(stats, ensure_ascii=False, default=str))
     else:

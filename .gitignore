@@ -1,11 +1,37 @@
-# Python / uv
+# Python / 构建产物
 __pycache__/
 *.pyc
 .venv/
 dist/
+build/
+*.egg-info/
 
-# 本地数据库与个人财务数据,一律不入库
+# 本地操作系统元数据
+.DS_Store
+
+# 本地数据库、备份与个人财务数据，一律不入库
 data/
+local-backups/
+backups/
 *.duckdb
 *.duckdb.wal
+*.duckdb.tmp
 *.csv
+
+# Gmail / 邮件原文与导出数据
+*.eml
+*.mbox
+*gmail*.json
+*econfirm*.json
+
+# 本地凭据、Token 与私有配置
+.env
+.env.*
+!.env.example
+credentials*.json
+client_secret*.json
+token*.json
+*.pem
+*.key
+*.p12
+*.pfx

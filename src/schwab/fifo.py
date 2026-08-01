@@ -178,14 +178,33 @@ def rebuild(con) -> dict:
 
     幂等:先清空两张产物表再重放,任意次执行结果一致。
     """
-    # 按生效日升序、同日 seq 降序(CSV 最新在前,同日内 seq 大者更早)
+    # 同一账户、日期、合约若来自多个未对齐快照，文件内 seq 不可直接比较。
+    # 此时拒绝猜测顺序，要求用户导入包含该日全部交易的较新快照重新锚定。
+    ambiguous = con.execute(
+        """
+        SELECT account, txn_date, raw_symbol, count(DISTINCT source_hash) AS sources
+        FROM transactions
+        WHERE asset_type IN ('stock', 'option')
+        GROUP BY account, txn_date, raw_symbol
+        HAVING count(DISTINCT source_hash) > 1
+        ORDER BY account, txn_date, raw_symbol
+        """
+    ).fetchone()
+    if ambiguous is not None:
+        account, txn_date, symbol, sources = ambiguous
+        raise FifoError(
+            f"{txn_date} {symbol}: 同日交易来自 {sources} 个未对齐的 CSV 快照"
+            f"(账户 {account})，无法可靠确定 FIFO 顺序；请导入覆盖该日全部交易的最新导出文件"
+        )
+
+    # 按生效日升序、同日 seq 降序；txn_hash 仅作为完全确定性的最终排序键。
     rows = con.execute(
         """
         SELECT txn_hash, account, txn_date, action, raw_symbol, asset_type,
                underlying, expiry, strike, option_type, quantity, price, fees
         FROM transactions
         WHERE asset_type IN ('stock', 'option')
-        ORDER BY txn_date ASC, seq DESC
+        ORDER BY txn_date ASC, seq DESC, txn_hash ASC
         """
     ).fetchall()
     cols = ["txn_hash", "account", "txn_date", "action", "raw_symbol", "asset_type",
@@ -217,36 +236,41 @@ def rebuild(con) -> dict:
         else:
             raise FifoError(f"未处理的持仓 Action: {txn.action!r}")  # 理论上 ingest 已拦截
 
-    # 落库:先清后写,保证幂等
-    con.execute("DELETE FROM lots")
-    con.execute("DELETE FROM realized")
-
     open_lots = [lot for book in books.values() for lot in book if lot.remaining_qty > 0]
-    for lot in open_lots:
-        con.execute(
-            """
-            INSERT INTO lots (account, symbol_key, asset_type, underlying, expiry,
-                              strike, option_type, direction, open_date, open_price,
-                              open_qty, remaining_qty, open_fees, open_txn)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [lot.account, lot.symbol_key, lot.asset_type, lot.underlying, lot.expiry,
-             lot.strike, lot.option_type, lot.direction, lot.open_date, lot.open_price,
-             lot.open_qty, lot.remaining_qty, lot.open_fees, lot.open_txn],
-        )
-    for r in realized:
-        con.execute(
-            """
-            INSERT INTO realized (account, symbol_key, asset_type, underlying, direction,
-                                  open_date, close_date, qty, open_price, close_price,
-                                  open_fees, close_fees, pnl, close_action, open_txn, close_txn)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [r["account"], r["symbol_key"], r["asset_type"], r["underlying"], r["direction"],
-             r["open_date"], r["close_date"], r["qty"], r["open_price"], r["close_price"],
-             r["open_fees"], r["close_fees"], r["pnl"], r["close_action"],
-             r["open_txn"], r["close_txn"]],
-        )
+    con.execute("BEGIN TRANSACTION")
+    try:
+        # 删除旧产物与写入新产物必须原子完成，避免失败后留下空表或半表。
+        con.execute("DELETE FROM lots")
+        con.execute("DELETE FROM realized")
+        for lot in open_lots:
+            con.execute(
+                """
+                INSERT INTO lots (account, symbol_key, asset_type, underlying, expiry,
+                                  strike, option_type, direction, open_date, open_price,
+                                  open_qty, remaining_qty, open_fees, open_txn)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [lot.account, lot.symbol_key, lot.asset_type, lot.underlying, lot.expiry,
+                 lot.strike, lot.option_type, lot.direction, lot.open_date, lot.open_price,
+                 lot.open_qty, lot.remaining_qty, lot.open_fees, lot.open_txn],
+            )
+        for r in realized:
+            con.execute(
+                """
+                INSERT INTO realized (account, symbol_key, asset_type, underlying, direction,
+                                      open_date, close_date, qty, open_price, close_price,
+                                      open_fees, close_fees, pnl, close_action, open_txn, close_txn)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [r["account"], r["symbol_key"], r["asset_type"], r["underlying"], r["direction"],
+                 r["open_date"], r["close_date"], r["qty"], r["open_price"], r["close_price"],
+                 r["open_fees"], r["close_fees"], r["pnl"], r["close_action"],
+                 r["open_txn"], r["close_txn"]],
+            )
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
 
     # 数据质量检查:已过到期日仍未平的期权,通常意味着缺少 Expired/平仓行
     warnings = [

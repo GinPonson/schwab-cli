@@ -17,7 +17,7 @@ DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "schwab" / "schwab.duckdb"
 
 # 建表 DDL:
 # - import_files: 文件级导入登记(file_hash 为文件内容哈希,防止整文件重复导入)
-# - transactions: 清洗后的统一交易表,txn_hash 为规范化行内容哈希,行级幂等去重;
+# - transactions: 清洗后的统一交易表,txn_hash 为稳定业务哈希,跨快照幂等去重;
 #   seq 保留文件内原始行序(CSV 为最新在前),供 FIFO 重放确定同日先后
 # - lots / realized: FIFO 引擎产物,由 rebuild 全量重建
 SCHEMA_SQL = """
