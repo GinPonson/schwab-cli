@@ -556,9 +556,16 @@ def _parse_value_rows(
 
 
 def _parse_labeled_fees(values: list[str], *, where: str) -> tuple[Decimal, str]:
-    """严格解析 Commission、Industry Fee 与 Total 标签组成的费用区域。"""
+    """严格解析带标签的费用区域，并返回总费用与成交净额。
+
+    期权模板通常包含 Commission、Industry Fee 和 Total；部分股票卖出模板
+    仅包含 Industry Fee，随后可能带一个重复的说明单元格，再直接给出净额。
+    """
     index = 0
-    if index < len(values) and values[index].lower() == "commission:":
+    if values and values[0].lower() == "industry fee:":
+        # 股票无佣金模板：不猜测缺失字段，仅接受明确的 Industry Fee 标签。
+        commission = Decimal(0)
+    elif index < len(values) and values[index].lower() == "commission:":
         index += 1
         if index >= len(values) or not MONEY_RE.match(values[index]):
             raise IngestError(f"{where}: Commission 后缺少金额")
@@ -581,6 +588,18 @@ def _parse_labeled_fees(values: list[str], *, where: str) -> tuple[Decimal, str]
         raise IngestError(f"{where}: Industry Fee 后缺少金额")
     industry_fee = _decimal(values[index], where=where)
     index += 1
+
+    if commission == 0 and values[0].lower() == "industry fee:":
+        # plain 正文可能保留一个重复的 Industry Fee 说明单元格，HTML 则会省略。
+        if index < len(values) and values[index].lower() == "industry fee":
+            index += 1
+        if index >= len(values) or not MONEY_RE.match(values[index]):
+            raise IngestError(f"{where}: Industry Fee 后缺少成交净额")
+        amount = values[index]
+        index += 1
+        if index != len(values):
+            raise IngestError(f"{where}: 费用表包含未知字段: {values[index:]!r}")
+        return industry_fee, amount
 
     if index >= len(values) or values[index].lower() != "total:":
         raise IngestError(f"{where}: 缺少费用 Total 标签")

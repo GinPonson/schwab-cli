@@ -380,6 +380,47 @@ def test_new_stock_na_fee_structure_and_disclosure_are_parsed():
     assert trade.amount == Decimal("-2082.58")
 
 
+@pytest.mark.parametrize(
+    "fee_tail",
+    [
+        "\n\nIndustry Fee:\n\n$0.02\n\nIndustry Fee\n\n$1039.68",
+        "\n\nIndustry Fee:\n\n$0.02\n\n$1,039.68",
+    ],
+)
+def test_stock_industry_fee_only_structure_is_parsed(fee_tail):
+    """无 Commission/Total 的股票卖出模板应按明确的 Industry Fee 解析。"""
+    body = _trade_block(
+        symbol="INTC", description="INTEL CORP", action="Sale",
+        position_type="Margin", quantity="10", price="103.97",
+        principal="1039.70", fees="0", amount="1039.68",
+    ).replace(
+        "\n\n$1039.68\n\nAdditional information",
+        f"{fee_tail}\n\nAdditional information",
+    )
+
+    trade = parse_econfirm(_message(body))[0]
+
+    assert trade.action == "Sell"
+    assert trade.fees == Decimal("0.02")
+    assert trade.amount == Decimal("1039.68")
+
+
+def test_stock_industry_fee_only_structure_keeps_buy_net_validation():
+    """仅有 Industry Fee 的结构不得绕过买入净额必须增加费用的勾稽规则。"""
+    body = _trade_block(
+        symbol="INTC", description="INTEL CORP", action="Purchase",
+        position_type="Margin", quantity="10", price="103.97",
+        principal="1039.70", fees="0", amount="1039.68",
+    ).replace(
+        "\n\n$1039.68\n\nAdditional information",
+        "\n\nIndustry Fee:\n\n$0.02\n\n$1039.68"
+        "\n\nAdditional information",
+    )
+
+    with pytest.raises(IngestError, match="Total Amount 勾稽不符"):
+        parse_econfirm(_message(body))
+
+
 def test_multiple_zero_fee_stock_fills_are_expanded():
     """同一邮件交易块中的多个股票成交价应拆成独立 FIFO 记录。"""
     body = (
