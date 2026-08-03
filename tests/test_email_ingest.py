@@ -484,13 +484,16 @@ def test_multiple_option_fills_reject_fee_total_mismatch():
 
 
 def test_trailing_symbol_information_stub_is_skipped():
-    """邮件尾部仅含 Symbol 的信息副本不能被误判为缺少 Action 的交易。"""
+    """HTML 尾部重复的 Symbol 信息块不能被误判为缺少 Action 的交易。"""
     body = _trade_block(
         symbol="INTC", description="INTEL CORP", action="Purchase",
         position_type="Margin", quantity="10", price="88.8323",
         principal="888.32", fees="0", amount="888.32",
     ) + (
         "\n\nSymbol:\n\nINTC"
+        "\n\nhttps://example.invalid/security/INTC"
+        "\n\nSecurity Description:\n\nINTEL CORP"
+        "\n\nhttps://example.invalid/prospectus"
         "\n\nAdditional information for this security:\n\nDisclosure text"
     )
 

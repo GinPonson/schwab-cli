@@ -458,10 +458,21 @@ def _parse_econfirm_body(message_id: str, body: str) -> list[EmailTrade]:
     for block_index, raw_block in enumerate(parts[1:], start=1):
         block = raw_block.split("Additional information for this security:", 1)[0]
         block_lines = [line.strip() for line in block.splitlines() if line.strip()]
-        if len(block_lines) == 1 \
-                and "Additional information for this security:" in raw_block:
-            # 新模板会在正文末尾按 Symbol 重复纯信息块；仅跳过只有 Symbol 的副本，
-            # 避免用宽松的缺字段判断掩盖真正残缺的成交记录。
+        normalized_lines = {line.lower() for line in block_lines}
+        transaction_labels = {"action:", "trade date:", "quantity", "total amount"}
+        is_information_stub = (
+            "Additional information for this security:" in raw_block
+            and (
+                len(block_lines) == 1
+                or (
+                    "security description:" in normalized_lines
+                    and normalized_lines.isdisjoint(transaction_labels)
+                )
+            )
+        )
+        if is_information_stub:
+            # HTML 候选会在邮件末尾重复 Symbol、链接和 Security Description，
+            # 但不含任何成交字段；只跳过这种明确的信息副本，避免掩盖残缺交易。
             continue
         where = f"邮件 {message_id} 第{block_index}笔"
         first_line = block_lines[0] if block_lines else ""
