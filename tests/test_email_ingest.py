@@ -444,6 +444,77 @@ def test_multiple_zero_fee_stock_fills_are_expanded():
     assert [trade.amount for trade in trades] == [Decimal("-1346.55"), Decimal("-1303.00")]
 
 
+def _multi_price_option_body(*, total_fees: str = "1.32") -> str:
+    """构造新版 Schwab 逐腿列出费用的多价格期权成交块。"""
+    return (
+        "\n\nSymbol:\n\nAAPL 03/19/2027 330.00 C"
+        "\n\nSecurity Description:\n\nAPPLE INC 03/19/2027 $330 Call"
+        "\n\nAction:\n\nPurchase"
+        "\n\nSecurity No./CUSIP:\n\n000131616294"
+        "\n\nType:\n\nMargin"
+        "\n\nTrade Date:\n\n07/31/26"
+        "\n\nSettle Date:\n\n08/03/26"
+        "\n\nQuantity\n\nPrice\n\nPrincipal\n\nCharge and/or Interest\n\nTotal Amount"
+        "\n\n1.00000\n\n$18.700000000\n\n$1870.00"
+        "\n\nCommission:\n\n$0.65\n\nCommission"
+        "\n\nIndustry Fee:\n\n$0.01\n\nTotal:\n\n$0.66\n\n$1870.66"
+        "\n\nFor the above:"
+        "\n\n1.00000\n\n$18.000000000\n\n$1800.00"
+        "\n\nCommission:\n\n$0.65\n\nCommission"
+        "\n\nIndustry Fee:\n\n$0.01\n\nTotal:\n\n$0.66\n\n$1800.66"
+        f"\n\nFor the above:\n\nTotals\n\n2.00000\n\n$3670.00"
+        f"\n\n${total_fees}\n\n$3671.32"
+        "\n\nAdditional information for this security:"
+    )
+
+
+def test_multiple_option_fills_use_explicit_per_leg_fees():
+    """新版多价格期权必须按邮件明示费用拆腿，并与 Totals 勾稽。"""
+    trades = parse_econfirm(_message(_multi_price_option_body()))
+
+    assert [trade.price for trade in trades] == [Decimal("18.700000000"), Decimal("18.000000000")]
+    assert [trade.fees for trade in trades] == [Decimal("0.66"), Decimal("0.66")]
+    assert [trade.amount for trade in trades] == [Decimal("-1870.66"), Decimal("-1800.66")]
+
+
+def test_multiple_option_fills_reject_fee_total_mismatch():
+    """逐腿费用与 Totals 不一致时必须暴露错误，不能推测或平均分摊。"""
+    with pytest.raises(IngestError, match="逐腿合计 1.32 与 Totals 1.31 不一致"):
+        parse_econfirm(_message(_multi_price_option_body(total_fees="1.31")))
+
+
+def test_trailing_symbol_information_stub_is_skipped():
+    """邮件尾部仅含 Symbol 的信息副本不能被误判为缺少 Action 的交易。"""
+    body = _trade_block(
+        symbol="INTC", description="INTEL CORP", action="Purchase",
+        position_type="Margin", quantity="10", price="88.8323",
+        principal="888.32", fees="0", amount="888.32",
+    ) + (
+        "\n\nSymbol:\n\nINTC"
+        "\n\nAdditional information for this security:\n\nDisclosure text"
+    )
+
+    trades = parse_econfirm(_message(body))
+
+    assert len(trades) == 1
+    assert trades[0].symbol == "INTC"
+
+
+def test_incomplete_trade_block_is_not_silently_skipped():
+    """除纯信息副本外，缺少 Action 的成交块仍必须明确失败。"""
+    body = (
+        "\n\nSymbol:\n\nINTC"
+        "\n\nSecurity Description:\n\nINTEL CORP"
+        "\n\nType:\n\nMargin"
+        "\n\nTrade Date:\n\n07/31/26"
+        "\n\nTotal Amount\n\n1\n\n$10.00\n\n$10.00\n\n$10.00"
+        "\n\nAdditional information for this security:"
+    )
+
+    with pytest.raises(IngestError, match="缺少字段 'Action'"):
+        parse_econfirm(_message(body))
+
+
 def test_import_email_cli_imports_and_is_idempotent(tmp_path):
     """import-email 应复用现有导入校验，并可安全重复处理同一 Gmail JSON。"""
     body = _trade_block(

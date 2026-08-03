@@ -457,8 +457,14 @@ def _parse_econfirm_body(message_id: str, body: str) -> list[EmailTrade]:
     trades: list[EmailTrade] = []
     for block_index, raw_block in enumerate(parts[1:], start=1):
         block = raw_block.split("Additional information for this security:", 1)[0]
+        block_lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(block_lines) == 1 \
+                and "Additional information for this security:" in raw_block:
+            # 新模板会在正文末尾按 Symbol 重复纯信息块；仅跳过只有 Symbol 的副本，
+            # 避免用宽松的缺字段判断掩盖真正残缺的成交记录。
+            continue
         where = f"邮件 {message_id} 第{block_index}笔"
-        first_line = next((line.strip() for line in block.splitlines() if line.strip()), "")
+        first_line = block_lines[0] if block_lines else ""
         symbol = _unwrap_symbol(first_line)
         description = _field(block, "Security Description", where=where)
         reported_action = _field(block, "Action", where=where)
@@ -493,33 +499,62 @@ def _parse_value_rows(
 ) -> list[EmailTrade]:
     """解析成交金额区域，并在可确定时展开多价格成交。
 
-    单笔期权可包含 commission 与 industry fee；多价格成交仅在各行金额可直接
-    勾稽且汇总费用为零时展开，避免自行猜测费用分配。
+    单笔期权可包含 commission 与 industry fee；多价格成交仅在各腿金额与费用
+    均可直接解析并与 Totals 勾稽时展开，避免自行猜测费用分配。
     """
     # 金额表后的披露文本不属于成交字段；仅接受已知边界，避免吞掉未知格式。
     disclosure_index = next((
         index for index, value in enumerate(values)
         if value.lower().startswith("for the above:")
     ), None)
-    if disclosure_index is not None:
+    if disclosure_index is not None and "Totals" not in values:
+        # 含 Totals 的多价格模板也用该文本分隔成交腿，需留给逐腿解析。
         values = values[:disclosure_index]
 
     if "Totals" in values:
         totals_index = values.index("Totals")
         fill_values = values[:totals_index]
         totals = values[totals_index + 1:]
-        if len(fill_values) % 4 != 0 or len(totals) < 4:
+        if len(totals) < 4:
             raise IngestError(f"{where}: 无法识别多价格成交结构")
         total_fees = _decimal(totals[-2], where=where)
-        if total_fees != 0:
-            raise IngestError(f"{where}: 多价格成交费用无法可靠分摊: {total_fees}")
-        rows = []
-        for offset in range(0, len(fill_values), 4):
-            qty, price, principal, amount = fill_values[offset:offset + 4]
-            rows.append(_build_trade(
-                trade_date, action, symbol, description, qty, price, principal,
-                Decimal(0), amount, multiplier, where,
-            ))
+        if fill_values and fill_values[-1].lower().startswith("for the above:"):
+            # 新模板在最后一个成交腿与 Totals 之间也保留分隔标记；它结束前一腿，
+            # 并不代表后面还有一个空成交腿。
+            fill_values = fill_values[:-1]
+        separators = [
+            index for index, value in enumerate(fill_values)
+            if value.lower().startswith("for the above:")
+        ]
+        rows: list[EmailTrade] = []
+        if separators:
+            starts = [0, *(index + 1 for index in separators)]
+            ends = [*separators, len(fill_values)]
+            for start, end in zip(starts, ends):
+                leg = fill_values[start:end]
+                if len(leg) < 4:
+                    raise IngestError(f"{where}: 多价格成交单腿字段不足: {leg!r}")
+                qty, price, principal = leg[:3]
+                fees, amount = _parse_labeled_fees(leg[3:], where=where)
+                rows.append(_build_trade(
+                    trade_date, action, symbol, description, qty, price, principal,
+                    fees, amount, multiplier, where,
+                ))
+        else:
+            if len(fill_values) % 4 != 0:
+                raise IngestError(f"{where}: 无法识别多价格成交结构")
+            for offset in range(0, len(fill_values), 4):
+                qty, price, principal, amount = fill_values[offset:offset + 4]
+                rows.append(_build_trade(
+                    trade_date, action, symbol, description, qty, price, principal,
+                    Decimal(0), amount, multiplier, where,
+                ))
+        parsed_fees = sum((row.fees for row in rows), Decimal(0))
+        if parsed_fees != total_fees:
+            raise IngestError(
+                f"{where}: 多价格成交费用无法可靠分摊: "
+                f"逐腿合计 {parsed_fees} 与 Totals {total_fees} 不一致"
+            )
         if sum(row.quantity for row in rows) != _decimal(totals[0], where=where):
             raise IngestError(f"{where}: 多价格成交数量与 Totals 不一致")
         if sum(abs(row.amount) for row in rows) != _decimal(totals[-1], where=where):
