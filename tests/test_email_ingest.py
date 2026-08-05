@@ -444,6 +444,44 @@ def test_multiple_zero_fee_stock_fills_are_expanded():
     assert [trade.amount for trade in trades] == [Decimal("-1346.55"), Decimal("-1303.00")]
 
 
+def test_multiple_zero_fee_stock_fills_with_na_row_are_expanded():
+    """每条腿用 [N/A:, $0.00, N/A, $amount] 表示零费用的股票多腿应正确拆腿。
+
+    Schwab 真实邮件示例（INTC 2026-08-03 两腿成交）— 不识别这种费用行会让
+    `_parse_labeled_fees` 抛「无法识别 Commission 字段」并阻断整封邮件。
+    """
+    body = (
+        "\n\nSymbol:\n\nINTC"
+        "\n\nSecurity Description:\n\nINTEL CORP"
+        "\n\nAction:\n\nPurchase"
+        "\n\nSecurity No./CUSIP:\n\n458140100"
+        "\n\nType:\n\nMargin"
+        "\n\nTrade Date:\n\n08/03/26"
+        "\n\nSettle Date:\n\n08/04/26"
+        "\n\nQuantity\n\nPrice\n\nPrincipal\n\nCharge and/or Interest\n\nTotal Amount"
+        "\n\n10.00000\n\n$86.550000000\n\n$865.50"
+        "\n\nN/A:\n\n$0.00\n\nN/A\n\n$865.50"
+        "\n\nFor the above:"
+        "\n\n10.00000\n\n$86.160000000\n\n$861.60"
+        "\n\nN/A:\n\n$0.00\n\nN/A\n\n$861.60"
+        "\n\nFor the above:\n\nTotals\n\n20.00000\n\n$1727.10\n\n$0.00\n\n$1727.10"
+        "\n\nAdditional information for this security:"
+    )
+
+    trades = parse_econfirm(_message(body))
+
+    assert [trade.price for trade in trades] == [
+        Decimal("86.550000000"),
+        Decimal("86.160000000"),
+    ]
+    assert [trade.quantity for trade in trades] == [Decimal("10"), Decimal("10")]
+    assert [trade.fees for trade in trades] == [Decimal("0"), Decimal("0")]
+    assert [trade.amount for trade in trades] == [
+        Decimal("-865.50"),
+        Decimal("-861.60"),
+    ]
+
+
 def _multi_price_option_body(*, total_fees: str = "1.32") -> str:
     """构造新版 Schwab 逐腿列出费用的多价格期权成交块。"""
     return (
