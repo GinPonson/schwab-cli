@@ -606,7 +606,22 @@ def _parse_labeled_fees(values: list[str], *, where: str) -> tuple[Decimal, str]
 
     期权模板通常包含 Commission、Industry Fee 和 Total；部分股票卖出模板
     仅包含 Industry Fee，随后可能带一个重复的说明单元格，再直接给出净额。
+    部分股票多价格成交使用 [N/A:, $0.00, N/A, $amount] 表示零费用行。
     """
+    # 股票多价格成交的零费用行：plain 模板在每条腿后保留 N/A 标签、零 Industry
+    # Fee 值、N/A 说明与成交净额。该模板无 Commission 也无 Industry Fee 标签。
+    if (
+        len(values) == 4
+        and values[0].lower() == "n/a:"
+        and values[2].lower() == "n/a"
+        and MONEY_RE.match(values[1])
+        and MONEY_RE.match(values[3])
+    ):
+        fees = _decimal(values[1], where=where)
+        if fees != 0:
+            raise IngestError(f"{where}: N/A 费用必须为 0，实际 {fees}")
+        return fees, values[3]
+
     index = 0
     if values and values[0].lower() == "industry fee:":
         # 股票无佣金模板：不猜测缺失字段，仅接受明确的 Industry Fee 标签。
